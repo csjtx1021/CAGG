@@ -1,0 +1,5 @@
+source ~/.bashrc 
+Go to nn/ and run 
+  $ python python unittest_nn_examples.py 
+To randomly generate 1000 neural networks with 
+maximum 20 nodes including input and output
