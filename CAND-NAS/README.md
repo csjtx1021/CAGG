@@ -26,7 +26,7 @@ Or you can see the help message by running as:
     
     or
     
-    $$ python CAND_Cell_based_NAS.py -h
+    $$ python CAND_Multi_Branch_NAS.py -h
 
 Run this code:
 
@@ -41,7 +41,7 @@ Run this code:
 
 (1) Pretrain the generation model in a VAE fashion by running as:
 
-    $$ python CAND.py --dataset="qm9" --max_nodes=9 --init_num=1000 --seed=1
+    $$ python CAND_Multi_Branch_NAS.py --dataset="nn" --max_nodes=20 --init_num=1000 --seed=1
     
 or, run an example as
 
