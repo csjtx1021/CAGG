@@ -5,11 +5,11 @@ search, to rigorously evaluate its effectiveness and applicability.
 
 ## An illustrative task 1: Molecular Discovery on QM9 data
     
-    ![image](https://csjtx1021.github.io/img/uploads/project_imgs/molecule_opt_rseed4.gif)
+![image](https://csjtx1021.github.io/img/uploads/project_imgs/molecule_opt_rseed4.gif)
 
 ## An illustrative task 2: Cell-based Neural Archtecture Search on CIFAR100 data
 
-    ![image](https://csjtx1021.github.io/img/uploads/project_imgs/nas_opt_rseed5.gif)
+![image](https://csjtx1021.github.io/img/uploads/project_imgs/nas_opt_rseed5.gif)
 
 ## Folder description:
 
