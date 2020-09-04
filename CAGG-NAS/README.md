@@ -65,7 +65,7 @@ DATA: When you want to choose different MLP data, you can open one of lines 15 a
     mlp_dataset_name="data/IndoorLoc.p" #input_dim=521
     #mlp_dataset_name="data/SliceLocalization.p" #input_dim=385
 
-(please see these examples in ``run_cand.sh")
+(please see these examples in ``run_cagg.sh")
 
 
 
