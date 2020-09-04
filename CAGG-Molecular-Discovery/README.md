@@ -47,7 +47,7 @@ or, when there are exist initialized networks in file, you should provide the fi
     
 Property: You can choose different property using ``property_name'' option.
 
-(please see the details and these examples in ``run_cand.sh")
+(please see the details and these examples in ``run_cagg.sh")
 
 
 
