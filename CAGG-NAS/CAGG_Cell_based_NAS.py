@@ -30,13 +30,20 @@ from torch.distributions.normal import Normal
 from torch_geometric.nn import global_add_pool
 from torch_geometric.data import DataLoader, Data
 from torch_scatter import scatter_add
-from data_utils import get_data, to_mol, dataset_info
+
 import csv
 import seaborn as sns
-import tools_for_multibranch as tools
+import tools
+
+import data_utils_NASBench_201
+from data_utils_NASBench_201 import get_data, to_mol, dataset_info
+from nas_201_api import NASBench201API as API
+
+#api = API('data/NAS-Bench-201-v1_0-e61699.pth')
+api = API('data/NAS-Bench-201-v1_1-096897.pth')
 
 use_prob_temp=True
-use_regularize=True
+use_regularize=False
 num_multi_gen = 1
 
 
@@ -53,16 +60,16 @@ LARGE_NUMBER = 1e10
 
 TASK_NO = 0
 
-
 import argparse
-parser = argparse.ArgumentParser(description='CAND')
+parser = argparse.ArgumentParser(description='CAGG')
 parser.add_argument('--seed', type=int, default=0, metavar='S',
                     help='random seed (default: 0)')
-parser.add_argument('--dataset', help='the dataset needs to be handled ["nn"] default:"nn"', default="nn")
-parser.add_argument('--max_nodes', type=int, default=20, metavar='S',
-                    help='maximum number of nodes while generating networks (default: 20)')
-parser.add_argument('--max_iter', type=int, default=60, metavar='S',
-                    help='maximum number of iterations (default: 60)')
+parser.add_argument('--dataset', help='the dataset needs to be handled ["NASBench201"] default:"NASBench201"', default="NASBench201")
+parser.add_argument('--image_data', help='the image dataset needs to be handled ["cifar100", "ImageNet16-120"] default:"cifar100"', default="cifar100")
+parser.add_argument('--max_nodes', type=int, default=4, metavar='S',
+                    help='maximum number of nodes while generating networks (default: 4)')
+parser.add_argument('--max_iter', type=int, default=390, metavar='S',
+                    help='maximum number of iterations (default: 390)')
 parser.add_argument('--init_num', type=int, default=10, metavar='S',
                     help='number of initialized networks (default: 10)')
 parser.add_argument('--dropout', type=float, default=0.1, metavar='S',
@@ -70,13 +77,14 @@ parser.add_argument('--dropout', type=float, default=0.1, metavar='S',
 parser.add_argument('--acq_type', help='the type of acquisition function ["EI"] default:"EI"', default="EI")
 parser.add_argument('--store_file_name', help='the output file name, default:"results/observations.csv"', default="results/observations.csv")
 parser.add_argument('--pretrain_name', help='the pretrained model name', default=None) #"models/orig_rand%s"%init_num
+parser.add_argument('--exist_init_nets', help='file name of the exist initialized networks', default=None) #"data/QM9_init/init_smiles_r%s.txt"%seed"
 parser.add_argument('--surr_num_epochs', type=int, default=600, metavar='S',
                     help='the number of epochs in training the surrogate model (default: 600)')
-parser.add_argument('--pretrain_num_epochs', type=int, default=70, metavar='S',
-                    help='the number of epochs in pre-training the generation model in a VAE fashion (default: 70)')
+parser.add_argument('--pretrain_num_epochs', type=int, default=500, metavar='S',
+                    help='the number of epochs in pre-training the generation model in a VAE fashion (default: 500)')
 parser.add_argument('--retrain_step', type=int, default=20, metavar='S',
                     help='every x steps to retrain the surrogate and generation models (default: 20)')
-parser.add_argument('--gen_num_epochs0', type=int, default=100, metavar='S',
+parser.add_argument('--gen_num_epochs0', type=int, default=200, metavar='S',
                     help='the number of epochs in training the generation model at the first time (default: 50)')
 parser.add_argument('--gen_num_epochs1', type=int, default=10, metavar='S',
                     help='the number of epochs in retraining the generation model after the first time (default: 10)')
@@ -100,6 +108,7 @@ np.random.seed(seed)
 random.seed(seed)
 
 dataset_name = args.dataset
+image_data = args.image_data
 max_nodes = args.max_nodes
 max_iter = args.max_iter
 init_num = args.init_num
@@ -107,10 +116,12 @@ dropout = args.dropout
 use_random = True
 acq_type = args.acq_type
 use_hard = False
-model_name = "ours-%s"%(dataset_name) #"noAug" "ours" "ours-wotrain" "ours-soft"
+#property_name = args.property_name
+model_name = "ours-%s-%s"%(dataset_name,image_data)
 store_file_name = args.store_file_name
 input_dim = 82
 pretrain_name = args.pretrain_name
+exist_init_nets = args.exist_init_nets
 surr_num_epochs = args.surr_num_epochs
 pretrain_num_epochs = args.pretrain_num_epochs
 retrain_step = args.retrain_step
@@ -481,19 +492,27 @@ class Generator_DeConv(nn.Module):
         
         #print("self.gen_model(Z.view(b,-1,1,1)).size()",self.gen_model(Z.view(b,-1,1,1)).size(),Z.view(b,-1,1,1).size())
         out = self.gen_model(Z.view(b,-1,1,1)).view(b,n,-1) #[b,1,n,(# node type + 1) + n*(# edge type + 1)]
-        out_nodes = out[:,:,0:self.num_node_type+1].view(b,n,-1) #[b,n,d]->[b, n, # node type + 1]
+        #out_nodes = out[:,:,0:self.num_node_type+1].view(b,n,-1) #[b,n,d]->[b, n, # node type + 1]
         
         #The following case is deterministic: the first node is input and the last node is ouput
         #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
         # and 0,1 for input and ouput
-        out_nodes_mask = torch.zeros_like(out_nodes)
-        out_nodes_mask[:,:,1] = -LARGE_NUMBER
-        out_nodes_mask[:,0,1] = LARGE_NUMBER
-        out_nodes_mask[:,:,2] = -LARGE_NUMBER
-        out_nodes_mask[:,n-1,2] = LARGE_NUMBER
+        #out_nodes_mask = torch.zeros_like(out_nodes)
+        #out_nodes_mask[:,:,1] = -LARGE_NUMBER
+        #out_nodes_mask[:,0,1] = LARGE_NUMBER
+        #out_nodes_mask[:,:,2] = -LARGE_NUMBER
+        #out_nodes_mask[:,n-1,2] = LARGE_NUMBER
 
         #reparameterization
-        X = F.softmax(out_nodes + out_nodes_mask, dim=-1) #[b, n, # node type+1]
+        #X = F.softmax(out_nodes + out_nodes_mask, dim=-1) #[b, n, # node type+1]
+        
+        #X is fixed, i.e., #X = tensor([[0,1,0,0,0],[0,0,1,0,0],[0,0,0,1,0],[0,0,0,0,1]]) [b,4,5]
+        X = []
+        for j in range(1,self.max_nodes+1):
+            node_label = data_utils_NASBench_201.onehot(j,self.max_nodes+1)
+            X.append(node_label)
+        X = torch.tensor(X).float().view(1,n,-1).repeat(b,1,1) #[b,4,5]
+        
 
         all_edges = torch.triu_indices(n, n, 1).long() #[2,n*(n-1)/2]
         
@@ -502,8 +521,11 @@ class Generator_DeConv(nn.Module):
         idx_triu = torch.triu(torch.ones(b,n,n),diagonal=1) 
         out_edge = out_edge[idx_triu==1].view(b,-1,self.num_edge_type+1) #[b,n*(n-1)/2, # edge type + 1]
 
+        #the 0-index dim is fixed to zero
+        out_edge_mask = torch.zeros_like(out_edge)
+        out_edge_mask[:,:,0] = -LARGE_NUMBER
         #reparameterization
-        visited_edges = F.softmax(out_edge, dim=-1) #[b, # all edge, # edge type+1]
+        visited_edges = F.softmax(out_edge + out_edge_mask, dim=-1) #[b, # all edge, # edge type+1]
         
         #print("visited_edges=",visited_edges)
         edge_index_one = all_edges.to(self.device)
@@ -522,11 +544,12 @@ class Generator_DeConv(nn.Module):
         #print("X=",X)
 
         if use_hard:
-            X_temp = torch.zeros_like(X)
-            for b_idx in range(b):
-                for node_idx in range(n):
-                    index_one = np.random.choice(np.arange(self.num_node_type+1),p=X[b_idx,node_idx,:].detach().cpu().numpy())
-                    X_temp[b_idx,node_idx,index_one] = 1.
+            #X_temp = torch.zeros_like(X)
+            #for b_idx in range(b):
+            #    for node_idx in range(n):
+            #        index_one = np.random.choice(np.arange(self.num_node_type+1),p=X[b_idx,node_idx,:].detach().cpu().numpy())
+            #        X_temp[b_idx,node_idx,index_one] = 1.
+            X_temp = X
                     
             visited_edges_temp = torch.zeros_like(visited_edges)
             for b_idx in range(b):
@@ -572,16 +595,27 @@ class Generator_DeConv(nn.Module):
             #The following case is deterministic: the first node is input and the last node is ouput
             #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
             # and 0,1 for input and ouput
-            out_nodes_mask = torch.zeros_like(out_nodes)
-            out_nodes_mask[:,:,1] = -LARGE_NUMBER
-            out_nodes_mask[:,0,1] = LARGE_NUMBER
-            out_nodes_mask[:,:,2] = -LARGE_NUMBER
-            out_nodes_mask[:,n-1,2] = LARGE_NUMBER
+            #out_nodes_mask = torch.zeros_like(out_nodes)
+            #out_nodes_mask[:,:,1] = -LARGE_NUMBER
+            #out_nodes_mask[:,0,1] = LARGE_NUMBER
+            #out_nodes_mask[:,:,2] = -LARGE_NUMBER
+            #out_nodes_mask[:,n-1,2] = LARGE_NUMBER
 
             #X = F.gumbel_softmax(out_nodes, tau=temperature, hard=True, dim=-1).detach() #[b, n, # node type+1]
-            X_probs = F.softmax(out_nodes + out_nodes_mask,dim=-1).detach() #[b, n, # node type+1]
-            #visited_edges = F.gumbel_softmax(out_edge, tau=temperature, hard=True, dim=-1).detach() #[b, # all edge, # edge type+1]
-            out_edge_probs = F.softmax(out_edge,dim=-1).detach() #[b, # all edge, # edge type+1]
+            #X_probs = F.softmax(out_nodes + out_nodes_mask,dim=-1).detach() #[b, n, # node type+1]
+            #X_probs is fixed, i.e., #X = tensor([[0,1,0,0,0],[0,0,1,0,0],[0,0,0,1,0],[0,0,0,0,1]]) [b,4,5]
+            X_probs = []
+            for j in range(1,self.max_nodes+1):
+                node_label = data_utils_NASBench_201.onehot(j,self.max_nodes+1)
+                X_probs.append(node_label)
+            X_probs = torch.tensor(X_probs).float().view(1,n,-1).repeat(b,1,1) #[b,4,5]
+            
+            #out_edge_probs = F.softmax(out_edge,dim=-1).detach() #[b, # all edge, # edge type+1]
+            #the 0-index dim is fixed to zero
+            out_edge_mask = torch.zeros_like(out_edge)
+            out_edge_mask[:,:,0] = -LARGE_NUMBER
+            #reparameterization
+            out_edge_probs = F.softmax(out_edge + out_edge_mask,dim=-1).detach() #[b, # all edge, # edge type+1]
 
             for decode_idx in range(decode_times):
                 X_temp = torch.zeros_like(X_probs)
@@ -626,21 +660,29 @@ class Generator_DeConv(nn.Module):
             #The following case is deterministic: the first node is input and the last node is ouput
             #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
             # and 0,1 for input and ouput
-            out_nodes_mask = torch.zeros_like(out_nodes)
-            out_nodes_mask[:,:,1] = -LARGE_NUMBER
-            out_nodes_mask[:,0,1] = LARGE_NUMBER
-            out_nodes_mask[:,:,2] = -LARGE_NUMBER
-            out_nodes_mask[:,n-1,2] = LARGE_NUMBER
+            #out_nodes_mask = torch.zeros_like(out_nodes)
+            #out_nodes_mask[:,:,1] = -LARGE_NUMBER
+            #out_nodes_mask[:,0,1] = LARGE_NUMBER
+            #out_nodes_mask[:,:,2] = -LARGE_NUMBER
+            #out_nodes_mask[:,n-1,2] = LARGE_NUMBER
 
-            out_nodes = out_nodes + out_nodes_mask
-            index_x = out_nodes.max(-1, keepdim=True)[1]
-            X = torch.zeros_like(out_nodes).scatter_(-1, index_x, 1.0)
+            #out_nodes = out_nodes + out_nodes_mask
+            #index_x = out_nodes.max(-1, keepdim=True)[1]
+            #X = torch.zeros_like(out_nodes).scatter_(-1, index_x, 1.0)
+            #X is fixed, i.e., #X = tensor([[0,1,0,0,0],[0,0,1,0,0],[0,0,0,1,0],[0,0,0,0,1]]) [b,4,5]
+            X = []
+            for j in range(1,self.max_nodes+1):
+                node_label = data_utils_NASBench_201.onehot(j,self.max_nodes+1)
+                X.append(node_label)
+            X = torch.tensor(X).float().view(1,n,-1).repeat(b,1,1) #[b,4,5]
 
-            index_edge = out_edge.max(-1, keepdim=True)[1]
+            out_edge_mask = torch.zeros_like(out_edge)
+            out_edge_mask[:,:,0] = -LARGE_NUMBER
+            index_edge = (out_edge + out_edge_mask).max(-1, keepdim=True)[1]
             visited_edges = torch.zeros_like(out_edge).scatter_(-1, index_edge, 1.0)
 
             #compute the log probability of generation
-            log_prob = torch.sum(torch.sum(torch.log(torch.softmax(out_nodes,dim=-1)+SMALL_NUMBER) * X,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(torch.softmax(out_edge,dim=-1)+SMALL_NUMBER) * visited_edges,dim=-1),dim=-1) #[b,]
+            log_prob = torch.sum(torch.sum(torch.log(torch.softmax(X,dim=-1)+SMALL_NUMBER) * X,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(torch.softmax(out_edge + out_edge_mask,dim=-1)+SMALL_NUMBER) * visited_edges,dim=-1),dim=-1) #[b,]
         
     
         edge_index = all_edges.long().to(self.device).view(2,-1)
@@ -1478,7 +1520,6 @@ class GenCandidates():
             print("generate_candidates_randomly")
             exit(1)
     
-    
     def generate_candidates(self, generator, Z=None, key=None, filter_flag=True, num_gen=100, use_random=False):
         
         print("generating the candidates")
@@ -1521,7 +1562,7 @@ class GenCandidates():
                     edge_attr_sparse_filtered.append(edge_attr_sparse_old[idx].view(1,-1))
             # print(len(edge_index_sparse_filtered),len(edge_attr_sparse_filtered))
             edge_index_sparse_filtered = torch.tensor(edge_index_sparse_filtered).t().long()
-            print("edge_index_sparse_filtered=",edge_index_sparse_filtered)
+            #print("edge_index_sparse_filtered=",edge_index_sparse_filtered)
 
             nodes_idx_filtered=[]
             if len(edge_index_sparse_filtered)>0:
@@ -1529,7 +1570,7 @@ class GenCandidates():
                 for idx in nodes_idx:
                     if idx in edge_index_sparse_filtered[0] or idx in edge_index_sparse_filtered[1]:
                         nodes_idx_filtered.append(idx)
-                print(nodes_idx_filtered)
+                #print(nodes_idx_filtered)
                 x_sparse = x[nodes_idx_filtered,:]
             
             
@@ -1566,7 +1607,8 @@ class GenCandidates():
         generator.train()
         
         if filter_flag:
-            return self.is_valid(graphs_sparse)
+            #return self.is_valid(graphs_sparse)
+            return self.is_valid_NASBench201(graphs_sparse)
         else:
             return graphs_sparse
     
@@ -1649,6 +1691,8 @@ class GenCandidates():
         print("valid size=",len(filtered_graphs),"/",len(graphs))
         return filtered_graphs
 
+    def is_valid_NASBench201(self,graphs):
+        return graphs
 
     def filter(self, graphs, key=None):
         mols = []
@@ -1719,7 +1763,7 @@ class ChooseNext():
         self.y_observed=None
     
     def next(self, candidates, acq_type):
-        best_one_idx = self.do_search_speedup(candidates, acq_type=acq_type, walkers=1)
+        best_one_idx = self.do_search_speedup(candidates, acq_type=acq_type, walkers=8)
         return [candidates[best_one_idx]],best_one_idx
 
     def score_one_can_Rand(self, d):
@@ -1856,6 +1900,167 @@ class testGenerativeQuality():
     def evaluate_NN(self,input_g):
         res = objective_func.evaluate_point(input_g)
         return res
+    
+    #convert graph to string representation in NASBench201
+    def get_archstr(self,input_g):
+        x = input_g[0]
+        edge_index = input_g[1]
+        edge_attr = input_g[2]
+        
+        def idx2opsstr(idx):
+            ops_str_list = ["none","skip_connect","nor_conv_1x1","nor_conv_3x3","avg_pool_3x3"]
+            return ops_str_list[idx]
+        
+        op_str_1_0 = idx2opsstr(torch.nonzero(edge_attr[0]).item()) #0->1
+        op_str_2_0 = idx2opsstr(torch.nonzero(edge_attr[1]).item()) #0->2
+        op_str_2_1 = idx2opsstr(torch.nonzero(edge_attr[3]).item()) #1->2
+        op_str_3_0 = idx2opsstr(torch.nonzero(edge_attr[2]).item()) #0->3
+        op_str_3_1 = idx2opsstr(torch.nonzero(edge_attr[4]).item()) #1->3
+        op_str_3_2 = idx2opsstr(torch.nonzero(edge_attr[5]).item()) #2->3
+        
+        arch_str = '|%s~0|+|%s~0|%s~1|+|%s~0|%s~1|%s~2|'%(op_str_1_0,op_str_2_0,op_str_2_1,op_str_3_0,op_str_3_1,op_str_3_2)
+    
+        return arch_str
+
+    # This function is to mimic the training and evaluatinig procedure for a single architecture `arch`.
+    # The time_cost is calculated as the total training time for a few (e.g., 12 epochs) plus the evaluation time for one epoch.
+    # For use_012_epoch_training = True, the architecture is trained for 12 epochs, with LR being decaded from 0.1 to 0.
+    #       In this case, the LR schedular is converged.
+    # For use_012_epoch_training = False, the architecture is planed to be trained for 200 epochs, but we early stop its procedure.
+    #       
+    def train_and_eval(self, arch, nas_bench, extra_info, dataname='cifar10-valid', use_012_epoch_training=True):
+
+        if use_012_epoch_training and nas_bench is not None:
+            arch_index = nas_bench.query_index_by_arch( arch )
+            assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
+            info = nas_bench.get_more_info(arch_index, dataname, None, True)
+            valid_acc, time_cost = info['valid-accuracy'], info['train-all-time'] + info['valid-per-time']
+            #_, valid_acc = info.get_metrics('cifar10-valid', 'x-valid' , 25, True) # use the validation accuracy after 25 training epochs
+        elif not use_012_epoch_training and nas_bench is not None:
+            # Please contact me if you want to use the following logic, because it has some potential issues.
+            # Please use `use_012_epoch_training=False` for cifar10 only.
+            # It did return values for cifar100 and ImageNet16-120, but it has some potential issues. (Please email me for more details)
+            arch_index, nepoch = nas_bench.query_index_by_arch( arch ), 25
+            assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
+            xoinfo = nas_bench.get_more_info(arch_index, 'cifar10-valid', None, True)
+            xocost = nas_bench.get_cost_info(arch_index, 'cifar10-valid', False)
+            info = nas_bench.get_more_info(arch_index, dataname, nepoch, False, True) # use the validation accuracy after 25 training epochs, which is used in our ICLR submission (not the camera ready).
+            cost = nas_bench.get_cost_info(arch_index, dataname, False)
+            # The following codes are used to estimate the time cost.
+            # When we build NAS-Bench-201, architectures are trained on different machines and we can not use that time record.
+            # When we create checkpoints for converged_LR, we run all experiments on 1080Ti, and thus the time for each architecture can be fairly compared.
+            nums = {'ImageNet16-120-train': 151700, 'ImageNet16-120-valid': 3000,
+                    'cifar10-valid-train' : 25000,  'cifar10-valid-valid' : 25000,
+                    'cifar100-train'      : 50000,  'cifar100-valid'      : 5000}
+            estimated_train_cost = xoinfo['train-per-time'] / nums['cifar10-valid-train'] * nums['{:}-train'.format(dataname)] / xocost['latency'] * cost['latency'] * nepoch
+            estimated_valid_cost = xoinfo['valid-per-time'] / nums['cifar10-valid-valid'] * nums['{:}-valid'.format(dataname)] / xocost['latency'] * cost['latency']
+            try:
+                valid_acc, time_cost = info['valid-accuracy'], estimated_train_cost + estimated_valid_cost
+            except:
+                valid_acc, time_cost = info['valtest-accuracy'], estimated_train_cost + estimated_valid_cost
+        else:
+            # train a model from scratch.
+            raise ValueError('NOT IMPLEMENT YET')
+        return valid_acc, time_cost
+    
+    def evaluate_NASBench201(self,input_g):
+        #res = objective_func.evaluate_point(input_g)
+        #convert graph to string representation in NASBench201
+        arch_str = self.get_archstr(input_g)
+        print(">>>>>>>> eval archstr:\"%s\" ..."%arch_str)
+
+        index = api.query_index_by_arch(arch_str)
+        
+        print(">>>>>>>> hash in NASBench201, idx = %s"%index)
+        
+        use_12epoch=False
+        if use_12epoch :
+            valid_acc, time_cost = self.train_and_eval(arch_str, api, None, dataname=image_data, use_012_epoch_training=True)
+            res = -1.0*(1.-valid_acc/100.)
+            
+            #get test results at 12th epoch (not use in search)
+            if image_data == "cifar10-valid":
+                results_cifar10_12 = api.query_by_index(index, "cifar10", use_12epochs_result=True) # a dict of all trials, where the key is the seed
+                results_cifar100_12 = api.query_by_index(index, "cifar100", use_12epochs_result=True)
+                results_ImageNet16_120_12 = api.query_by_index(index, "ImageNet16-120", use_12epochs_result=True)
+            else:
+                #results_12 = api.query_by_index(index, image_data, use_12epochs_result=True) # a dict of all trials, where the key is the seed
+                print("eval [%s] data is still not implemented"%image_data)
+                exit(1)
+            
+            #get test results at 200th epoch (not use in search)
+            if image_data == "cifar10-valid":
+                results_cifar10_200 = api.query_by_index(index, "cifar10", use_12epochs_result=False) # a dict of all trials, where the key is the seed
+                results_cifar100_200 = api.query_by_index(index, "cifar100", use_12epochs_result=False) # a dict of all trials, where the key is the seed
+                results_ImageNet16_120_200 = api.query_by_index(index, "ImageNet16-120", use_12epochs_result=False) # a dict of all trials, where the key is the seed
+            else:
+                #results_200 = api.query_by_index(index, image_data, use_12epochs_result=False) # a dict of all trials, where the key is the seed
+                print("eval [%s] data is still not implemented"%image_data)
+                exit(1)
+            
+            test_acc_list_cifar10_12 = [results_cifar10_12[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_cifar10_12.keys())]
+            test_acc_list_cifar100_12 = [results_cifar100_12[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_cifar100_12.keys())]
+            test_acc_list_ImageNet16_120_12 = [results_ImageNet16_120_12[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_ImageNet16_120_12.keys())]
+            
+            test_acc_list_cifar10_200 = [results_cifar10_200[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_cifar10_200.keys())]
+            test_acc_list_cifar100_200 = [results_cifar100_200[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_cifar100_200.keys())]
+            test_acc_list_ImageNet16_120_200 = [results_ImageNet16_120_200[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_ImageNet16_120_200.keys())]
+            
+            #get valid results at 200th epoch (not use in search)
+            results_cifar10_valid_200 = api.query_by_index(index, image_data) # a dict of all trials, where the key is the seed
+            cifar10_valid_accu_list_200 = [results_cifar10_valid_200[trial_seed_i].get_eval("x-valid")["accuracy"] for trial_seed_i in list(results_cifar10_valid_200.keys())]
+            results_cifar100_valid_200 = api.query_by_index(index, "cifar100") # a dict of all trials, where the key is the seed
+            cifar100_valid_accu_list_200 = [results_cifar100_valid_200[trial_seed_i].get_eval("x-valid")["accuracy"] for trial_seed_i in list(results_cifar100_valid_200.keys())]
+            results_ImageNet16_120_valid_200 = api.query_by_index(index, "ImageNet16-120") # a dict of all trials, where the key is the seed
+            ImageNet16_120_valid_accu_list_200 = [results_ImageNet16_120_valid_200[trial_seed_i].get_eval("x-valid")["accuracy"] for trial_seed_i in list(results_ImageNet16_120_valid_200.keys())]
+            
+            acc_info = {"cifar10":{"valid-200":cifar10_valid_accu_list_200,"test_12":test_acc_list_cifar10_12,"test_200":test_acc_list_cifar10_200},"cifar100":{"valid-200":cifar100_valid_accu_list_200,"test_12":test_acc_list_cifar100_12,"test_200":test_acc_list_cifar100_200},"ImageNet16-120":{"valid-200":ImageNet16_120_valid_accu_list_200,"test_12":test_acc_list_ImageNet16_120_12,"test_200":test_acc_list_ImageNet16_120_200}}
+            
+            print(">>>>>>>> get result in NASBench201, valid_error = %s (use in search), cost = %s, and acc_info = %s (not use in search, just test)"%(-res,time_cost,acc_info))
+        else:
+
+            """
+            Args [dataset] (4 possible options):
+            -- cifar10-valid : training the model on the CIFAR-10 training set.
+            -- cifar10 : training the model on the CIFAR-10 training + validation set.
+            -- cifar100 : training the model on the CIFAR-100 training set.
+            -- ImageNet16-120 : training the model on the ImageNet16-120 training set.
+            Args [setname] (each dataset has different setnames):
+            -- When dataset = cifar10-valid, you can use 'train', 'x-valid', 'ori-test'
+            ------ 'train' : the metric on the training set.
+            ------ 'x-valid' : the metric on the validation set.
+            ------ 'ori-test' : the metric on the test set.
+            -- When dataset = cifar10, you can use 'train', 'ori-test'.
+            ------ 'train' : the metric on the training + validation set.
+            ------ 'ori-test' : the metric on the test set.
+            -- When dataset = cifar100 or ImageNet16-120, you can use 'train', 'ori-test', 'x-valid', 'x-test'
+            ------ 'train' : the metric on the training set.
+            ------ 'x-valid' : the metric on the validation set.
+            ------ 'x-test' : the metric on the test set.
+            ------ 'ori-test' : the metric on the validation + test set.
+            """
+            results = api.query_by_index(index, image_data) # a dict of all trials, where the key is the seed
+            print ('>>>>>>>> there are {:} trials for this architecture on {:}'.format(len(results), image_data))
+            
+            valid_error_list = [1. - results[trial_seed_i].get_eval("x-valid")["accuracy"]/100. for trial_seed_i in list(results.keys())]
+        
+            #randomly choose one from multipy trials
+            res = -1.0*random.choice(valid_error_list)
+        
+            time_cost = 0.
+        
+            if image_data == "cifar10-valid":
+                results = api.query_by_index(index, "cifar10") # a dict of all trials, where the key is the seed
+
+            test_acc_list = [results[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results.keys())]
+            
+            acc_info = test_acc_list
+            
+            print(">>>>>>>> get result in NASBench201, valid_error = %s (use in search), cost = %s, and acc_info = %s (not use in search, just test)"%(-res,time_cost,acc_info))
+        
+        return res, time_cost, arch_str, index, acc_info
+    
+    
     #recall the real evaluation function to evaluate
     def evaluate_point(self, input):
         if input["smiles"]=="":
@@ -1903,8 +2108,26 @@ class testGenerativeQuality():
                         fieldnames = ["# eval", 'time', 'properties', time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))]
                         csvwriter.writerow(fieldnames)
                     csvwriter.writerow([self.count, time.time()-self.start_time,goal])
-                with open('results/architecture_%s_%s_%s.pkl'%(model_name,self.count,seed), 'wb') as f:
+                with open('results/architecture_%s_%s_%s.pkl'%(model_name,self.count,int(opts.random_seed)), 'wb') as f:
                     pickle.dump(mol, f)
+        return goal_list
+    
+    def test_NASBench201(self, generated_graphs,store_flag=True):
+        goal_list = []
+        for mol in generated_graphs:
+            goal, time_cost, arch_str, arch_index, test_acc_list = self.evaluate_NASBench201(mol)
+            goal_list.append({"y":goal})
+            if store_flag:
+                self.count += 1
+                #save into csv file
+                with open(self.filename,"a",newline="") as datacsv:
+                    csvwriter = csv.writer(datacsv)
+                    if self.count == 1:
+                        fieldnames = ["# eval", 'total_search_cost', 'one_eval_cost', 'properties', 'arch_str', 'arch_index','test_acc_list', time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))]
+                        csvwriter.writerow(fieldnames)
+                    csvwriter.writerow([self.count, time.time()-self.start_time, time_cost,goal,arch_str,arch_index,"%s"%test_acc_list])
+                #with open('results/architecture_%s_%s_%s.pkl'%(model_name,self.count,int(opts.random_seed)), 'wb') as f:
+                #    pickle.dump(mol, f)
         return goal_list
     
     def test_dataset(self,dataset):
@@ -1982,7 +2205,7 @@ if __name__ == "__main__":
     
         input_dim_n=dataset_info(dataset_name)["num_node_type"]
         input_dim_e=dataset_info(dataset_name)["num_edge_type"]
-
+        
         fixed_Z = torch.randn(1000,input_dim)
 
         #models
@@ -1990,63 +2213,38 @@ if __name__ == "__main__":
         predictor=Predictor(encoder_out_dim=5*57, mlp_pre=[55,55,55,55,55], predictor_act=1, dropout=dropout, device=device)
         surrogate=DeepSurrogate(encoder, predictor)
         
-        generator=Generator_DeConv(max_nodes=max_nodes, input_dim=input_dim, num_node_type=dataset_info(dataset_name)["num_node_type"], num_edge_type=dataset_info(dataset_name)["num_edge_type"], channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(1,1),(1,5),(2,4),(2,2)], paddings=[(0,0),(0,0),(1,1),(1,1)], output_padding=[(0,0),(0,0),(1,1),(1,1)], act=1, dropout=0.0, dataset=dataset_name, device=device)
+        generator=Generator_DeConv(max_nodes=max_nodes, input_dim=82, num_node_type=dataset_info(dataset_name)["num_node_type"], num_edge_type=dataset_info(dataset_name)["num_edge_type"], channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(2,1),(2,3),(1,2),(1,2)], paddings=[(1,0),(1,1),(1,1),(1,2)], output_padding=[(1,0),(1,1),(0,1),(0,0)], act=1, dropout=0.0, dataset=dataset_name, device=device)
 
-        if pretrain_name is None:
-            #do pretrain VAE
-            vaeencoder=VAEEncoder(input_dim_n, input_dim_e, em_node_mlp=[57], em_edge_mlp=[57], node_mlp=[57], edge_mlp=[57], num_fine=5, encoder_out_dim=82, dropout=0., encoder_act=1, device=device)
-        else:
-            vaeencoder = None
-
+        vaeencoder = None
         
         discriminator = []
 
         trainVAE = TrainVAE(vaeencoder, generator)
         trainSurr = TrainSurrogate(surrogate)
-        trainGen = TrainGenerator(None, surrogate, discriminator,lam_1 = lam_1,lam_2 = lam_2,lam_3 = lam_3)
+        trainGen = TrainGenerator(None, surrogate, discriminator,lam_1 = lam_1,lam_2 = lam_2,lam_3 = lam_3) #lam_1 = 0.019760427,lam_2 = 0.735347235,lam_3 = 0.122988917
         genCan = GenCandidates(dataset=dataset_name)
         chooseNext = ChooseNext(surrogate, constraint=None, generator=generator, vaeencoder=vaeencoder)
         
         eval_mol = testGenerativeQuality(filename=store_file_name,target='joint', dataset=dataset_name)
         
-        if pretrain_name is None:
-            #do pretrain
-            dataset = get_data(dataset_name)
-            index_list = random.sample(range(len(dataset)),init_num)
-            dataset.cutfromlist(index_list)
-            
-            #train VAE
-            trainVAE.train(dataset, batch_size=100, num_epochs=pretrain_num_epochs, learning_rate=1e-3, weight_decay=1e-5,run_one_batch=False)
-            
-            generator.save_model("models/orig_rand%s_epoch%s"%(init_num,pretrain_num_epochs))
-            vaeencoder.save_model("models/orig_vae_rand%s_epoch%s"%(init_num,pretrain_num_epochs))
-            
-            exit(0)
-
-        else:
-            #do pretrain
-            dataset = get_data(dataset_name)
-            index_list = random.sample(range(len(dataset)),init_num)
-            dataset.cutfromlist(index_list)
-
-        generator.restore_model(pretrain_name)
-        #vaeencoder.restore_model("models/orig_vae_rand1000_epoch700")
-
-        res=[]
+        
+        dataset = get_data(dataset_name)
+        start_idx = random.choice(range(len(dataset)-init_num))
+        dataset.cut(start_idx,start_idx+init_num)
+        
+        
         #evaluate the init graphs
         for i in range(len(dataset)):
-            results = eval_mol.test_NN([[dataset[i].x,dataset[i].edge_index,dataset[i].edge_attr]],store_flag=True)
+            results = eval_mol.test_NASBench201([[dataset[i].x,dataset[i].edge_index,dataset[i].edge_attr]],store_flag=True)
             dataset[i].y[:] = results[0]["y"]
             dataset.data_list[i].y[:] = results[0]["y"]
-            res.append(results[0]["y"])
+            #res.append(results[0]["y"])
 
         genCan.init_observed_data(dataset)
-
+        
+    
         generator_orig = copy.deepcopy(generator)
 
-        generator_orig.save_model("models/orig_pretrain")
-
-        #draw_dis(generator,fixed_Z,"orig")
 
         #do optimize
         for iter_idx in range(max_iter):
@@ -2059,20 +2257,21 @@ if __name__ == "__main__":
                 
                 trainSurr.train(dataset, batch_size=len(dataset), learning_rate=1e-3, weight_decay=reg, seed=seed, num_epochs=surr_num_epochs, convergence_err=SMALL_NUMBER)
                 #trainSurr.eval_surrogate(valid=dataset_test,name="test",tau=tau)
-                trainSurr.eval_surrogate(valid=dataset,name="train",tau=tau)
+                #trainSurr.eval_surrogate(valid=dataset,name="train",tau=tau)
 
                 #update current generator curr_g
                 if iter_idx==0:
                     num_epochs_gen_curr = gen_num_epochs0
                 else:
                     num_epochs_gen_curr = gen_num_epochs1
-                #generator=copy.deepcopy(generator_orig)
-                trainGen.train_GAN_and_Exp(generator, dataset, batch_size=50, lr_gen=5e-4, lr_disc=0.00005, weight_decay=1e-5, temperature=0.1, temperature_annealing_rate=1., num_epochs_gen=num_epochs_gen_curr, num_epochs_disc=5, use_random=use_random, use_regularize=True, use_exp=True, vaeencoder=vaeencoder, surrogate=surrogate, params=None)
+                
+                trainGen.train_GAN_and_Exp(generator, dataset, batch_size=50, lr_gen=1e-4, lr_disc=0.00005, weight_decay=1e-5, temperature=0.1, temperature_annealing_rate=1., num_epochs_gen=num_epochs_gen_curr, num_epochs_disc=5, use_random=use_random, use_regularize=False, use_exp=True, vaeencoder=vaeencoder, surrogate=surrogate, params=None)
                 #if iter_idx%40==0:
                 #    draw_dis(generator,fixed_Z,iter_idx)
 
             candidates_new = genCan.generate_candidates(generator, filter_flag=True, num_gen=1000, use_random=use_random)
-            candidates_orig = genCan.generate_candidates(generator_orig, filter_flag=True, num_gen=1000, use_random=use_random)
+            #candidates_orig = genCan.generate_candidates(generator_orig, filter_flag=True, num_gen=1000, use_random=use_random)
+            candidates_orig = []
             
             candidates = candidates_new + candidates_orig
             
@@ -2081,21 +2280,16 @@ if __name__ == "__main__":
             chooseNext.dataset=dataset
             chooseNext.y_observed = genCan.observed_data["y"]
             next_g_1, idx_1 = chooseNext.next(candidates,"EI")
-            #next_g_2, idx_2 = chooseNext.next(candidates,"Std")
             strategy_no = 0
 
-            #if idx_1==idx_2:
-                #next_g = next_g_1
-            #else:
-                #next_g = next_g_1 + next_g_2
             next_g = next_g_1
-            evaluation_list = eval_mol.test_NN(next_g)
+            evaluation_list = eval_mol.test_NASBench201(next_g)
+
             genCan.update_observed_data(next_g,evaluation_list)
             for i in range(len(evaluation_list)):
                 if evaluation_list[i]["y"] != -10.:
                     augment_into(dataset,{'x':next_g[i][0].float(),'edge_index':next_g[i][1].long(),'edge_attr':next_g[i][2].float(),'y':torch.tensor([evaluation_list[i]["y"]]).view(-1).float()}, comments="add one")
             #print(dataset,eval_mol.denormalize([evaluation_list[i]["y"] for i in range(len(evaluation_list))]))
-
             #generator.save_model("models/iter_%s_%s_%s_%s"%(model_name,acq_type,seed,iter_idx+1))
 
 

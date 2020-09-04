@@ -30,22 +30,14 @@ from torch.distributions.normal import Normal
 from torch_geometric.nn import global_add_pool
 from torch_geometric.data import DataLoader, Data
 from torch_scatter import scatter_add
-
+from data_utils import get_data, to_mol, dataset_info
 import csv
 import seaborn as sns
 import tools
 
-import data_utils_NASBench_201
-from data_utils_NASBench_201 import get_data, to_mol, dataset_info
-from nas_201_api import NASBench201API as API
-
-#api = API('data/NAS-Bench-201-v1_0-e61699.pth')
-api = API('data/NAS-Bench-201-v1_1-096897.pth')
-
-use_prob_temp=True
-use_regularize=False
+use_prob_temp = True
+use_regularize = True
 num_multi_gen = 1
-
 
 lam_1 = 10.
 lam_2 = 1.
@@ -61,20 +53,20 @@ LARGE_NUMBER = 1e10
 TASK_NO = 0
 
 import argparse
-parser = argparse.ArgumentParser(description='CAND')
+parser = argparse.ArgumentParser(description='CAGG')
 parser.add_argument('--seed', type=int, default=0, metavar='S',
                     help='random seed (default: 0)')
-parser.add_argument('--dataset', help='the dataset needs to be handled ["NASBench201"] default:"NASBench201"', default="NASBench201")
-parser.add_argument('--image_data', help='the image dataset needs to be handled ["cifar100", "ImageNet16-120"] default:"cifar100"', default="cifar100")
-parser.add_argument('--max_nodes', type=int, default=4, metavar='S',
-                    help='maximum number of nodes while generating networks (default: 4)')
-parser.add_argument('--max_iter', type=int, default=390, metavar='S',
-                    help='maximum number of iterations (default: 390)')
-parser.add_argument('--init_num', type=int, default=10, metavar='S',
-                    help='number of initialized networks (default: 10)')
+parser.add_argument('--dataset', help='the dataset needs to be handled ["qm9"] default:"qm9"', default="qm9")
+parser.add_argument('--max_nodes', type=int, default=9, metavar='S',
+                    help='maximum number of nodes while generating networks (default: 9)')
+parser.add_argument('--max_iter', type=int, default=500, metavar='S',
+                    help='maximum number of iterations (default: 500)')
+parser.add_argument('--init_num', type=int, default=50, metavar='S',
+                    help='number of initialized networks (default: 50)')
 parser.add_argument('--dropout', type=float, default=0.1, metavar='S',
                     help='dropout (default: 0.1)')
 parser.add_argument('--acq_type', help='the type of acquisition function ["EI"] default:"EI"', default="EI")
+parser.add_argument('--property_name', help='the property name that we want to optimize ["5*QED-SA","logP-SA"] default="5*QED-SA"', default="5*QED-SA")
 parser.add_argument('--store_file_name', help='the output file name, default:"results/observations.csv"', default="results/observations.csv")
 parser.add_argument('--pretrain_name', help='the pretrained model name', default=None) #"models/orig_rand%s"%init_num
 parser.add_argument('--exist_init_nets', help='file name of the exist initialized networks', default=None) #"data/QM9_init/init_smiles_r%s.txt"%seed"
@@ -84,7 +76,7 @@ parser.add_argument('--pretrain_num_epochs', type=int, default=500, metavar='S',
                     help='the number of epochs in pre-training the generation model in a VAE fashion (default: 500)')
 parser.add_argument('--retrain_step', type=int, default=20, metavar='S',
                     help='every x steps to retrain the surrogate and generation models (default: 20)')
-parser.add_argument('--gen_num_epochs0', type=int, default=200, metavar='S',
+parser.add_argument('--gen_num_epochs0', type=int, default=50, metavar='S',
                     help='the number of epochs in training the generation model at the first time (default: 50)')
 parser.add_argument('--gen_num_epochs1', type=int, default=10, metavar='S',
                     help='the number of epochs in retraining the generation model after the first time (default: 10)')
@@ -108,7 +100,6 @@ np.random.seed(seed)
 random.seed(seed)
 
 dataset_name = args.dataset
-image_data = args.image_data
 max_nodes = args.max_nodes
 max_iter = args.max_iter
 init_num = args.init_num
@@ -116,8 +107,8 @@ dropout = args.dropout
 use_random = True
 acq_type = args.acq_type
 use_hard = False
-#property_name = args.property_name
-model_name = "ours-%s-%s"%(dataset_name,image_data)
+property_name = args.property_name
+model_name = "ours-%s"%property_name #"noAug" "ours" "ours-wotrain" "ours-soft"
 store_file_name = args.store_file_name
 input_dim = 82
 pretrain_name = args.pretrain_name
@@ -128,6 +119,13 @@ retrain_step = args.retrain_step
 gen_num_epochs0 = args.gen_num_epochs0
 gen_num_epochs1 = args.gen_num_epochs1
 
+if property_name == '5*QED-SA':
+    target = 'joint'
+elif property_name == 'logP-SA':
+    target = 'logppunishedbysa'
+else:
+    print("cannot know the property name [%s], please choose from {\"5*QED-SA\",\"logP-SA\"}"%property_name)
+    exit(1)
 
 #----------------------------
 #Encoder
@@ -429,7 +427,7 @@ class DeepSurrogate(nn.Module):
 #Generator_DeConv
 #------------------------------------------------------------
 class Generator_DeConv(nn.Module):
-    def __init__(self, max_nodes=30, input_dim=32, num_node_type=5, num_edge_type=3, channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(1,1),(1,4),(1,2),(1,2)], paddings=[(0,0),(0,0),(0,1),(0,1)], output_padding=[(0,0),(0,0),(0,0),(0,0)],act=1, dropout=0.0, dataset="qm9", device=None):
+    def __init__(self, max_nodes=30, input_dim=32, num_node_type=5, num_edge_type=3, channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(1,1),(1,4),(1,2),(1,2)], paddings=[(0,0),(0,0),(0,1),(0,1)], act=1, dropout=0.0, dataset="qm9", device=None):
         super(Generator_DeConv, self).__init__()
         
         self.dataset=dataset
@@ -442,7 +440,6 @@ class Generator_DeConv(nn.Module):
         self.kernels=kernels
         self.strides=strides
         self.paddings=paddings
-        self.output_padding=output_padding
         self.dropout=dropout
         self.use_prob_temp=use_prob_temp
         self.num_multi_gen=num_multi_gen
@@ -460,9 +457,9 @@ class Generator_DeConv(nn.Module):
         self.gen_model = torch.nn.Sequential()
         for i in range(len(self.channels)):
             if i==0:
-                self.gen_model.add_module("ConvTranspose2d_%s"%(i+1),nn.ConvTranspose2d(self.input_dim, self.channels[i], self.kernels[i], self.strides[i], self.paddings[i], self.output_padding[i],bias=False))
+                self.gen_model.add_module("ConvTranspose2d_%s"%(i+1),nn.ConvTranspose2d(self.input_dim, self.channels[i], self.kernels[i], self.strides[i], self.paddings[i], bias=False))
             else:
-                self.gen_model.add_module("ConvTranspose2d_%s"%(i+1),nn.ConvTranspose2d(self.channels[i-1], self.channels[i], self.kernels[i], self.strides[i], self.paddings[i], self.output_padding[i],bias=False))            
+                self.gen_model.add_module("ConvTranspose2d_%s"%(i+1),nn.ConvTranspose2d(self.channels[i-1], self.channels[i], self.kernels[i], self.strides[i], self.paddings[i], bias=False))            
             if i<len(self.channels)-1:
                 self.gen_model.add_module("BatchNorm2d_%s"%(i+1),nn.BatchNorm2d(self.channels[i]))
                 self.gen_model.add_module("act_%s"%(i+1),self.act())
@@ -487,45 +484,22 @@ class Generator_DeConv(nn.Module):
         n = self.max_nodes
         
         assert n == self.max_nodes
-        #print(n,self.max_nodes)
         #assert self.input_dim == Z.size(2)
         
-        #print("self.gen_model(Z.view(b,-1,1,1)).size()",self.gen_model(Z.view(b,-1,1,1)).size(),Z.view(b,-1,1,1).size())
         out = self.gen_model(Z.view(b,-1,1,1)).view(b,n,-1) #[b,1,n,(# node type + 1) + n*(# edge type + 1)]
-        #out_nodes = out[:,:,0:self.num_node_type+1].view(b,n,-1) #[b,n,d]->[b, n, # node type + 1]
-        
-        #The following case is deterministic: the first node is input and the last node is ouput
-        #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
-        # and 0,1 for input and ouput
-        #out_nodes_mask = torch.zeros_like(out_nodes)
-        #out_nodes_mask[:,:,1] = -LARGE_NUMBER
-        #out_nodes_mask[:,0,1] = LARGE_NUMBER
-        #out_nodes_mask[:,:,2] = -LARGE_NUMBER
-        #out_nodes_mask[:,n-1,2] = LARGE_NUMBER
-
+        out_nodes = out[:,:,0:self.num_node_type+1].view(b,n,-1) #[b,n,d]->[b, n, # node type + 1]
+            
         #reparameterization
-        #X = F.softmax(out_nodes + out_nodes_mask, dim=-1) #[b, n, # node type+1]
-        
-        #X is fixed, i.e., #X = tensor([[0,1,0,0,0],[0,0,1,0,0],[0,0,0,1,0],[0,0,0,0,1]]) [b,4,5]
-        X = []
-        for j in range(1,self.max_nodes+1):
-            node_label = data_utils_NASBench_201.onehot(j,self.max_nodes+1)
-            X.append(node_label)
-        X = torch.tensor(X).float().view(1,n,-1).repeat(b,1,1) #[b,4,5]
-        
+        X = F.softmax(out_nodes, dim=-1) #[b, n, # node type+1]
 
         all_edges = torch.triu_indices(n, n, 1).long() #[2,n*(n-1)/2]
-        
-        #print("out.size()=",out.size())
+            
         out_edge = out[:,:,self.num_node_type+1:].view(b,n,n,self.num_edge_type+1) #[b, n,n, # edge type + 1]
         idx_triu = torch.triu(torch.ones(b,n,n),diagonal=1) 
         out_edge = out_edge[idx_triu==1].view(b,-1,self.num_edge_type+1) #[b,n*(n-1)/2, # edge type + 1]
 
-        #the 0-index dim is fixed to zero
-        out_edge_mask = torch.zeros_like(out_edge)
-        out_edge_mask[:,:,0] = -LARGE_NUMBER
         #reparameterization
-        visited_edges = F.softmax(out_edge + out_edge_mask, dim=-1) #[b, # all edge, # edge type+1]
+        visited_edges = F.softmax(out_edge, dim=-1) #[b, # all edge, # edge type+1]
         
         #print("visited_edges=",visited_edges)
         edge_index_one = all_edges.to(self.device)
@@ -535,21 +509,22 @@ class Generator_DeConv(nn.Module):
             batch = batch + [i]*n
             edge_index.append(edge_index_one+i*n)
 
-        edge_index = torch.cat(edge_index,dim=-1).long().to(self.device).view(2,-1)
+        edge_index = torch.cat(edge_index,dim=-1).long().to(self.device)
+        edge_index = edge_index[[0,1,1,0]].view(2,-1)
         batch = torch.tensor(batch).long().to(self.device)
         edge_attr = visited_edges
+        edge_attr = torch.cat([edge_attr,edge_attr],dim=1) #[b, 2*alledges,# edge type+1]
         #print("nodes=",X[:,:,1:])
         #print("active_node=",torch.sum(1.0 - X[:,:,0].view(-1)))
         #print("active_edge=",torch.sum(1.0 - edge_attr[:,:,0].view(-1)))
         #print("X=",X)
 
         if use_hard:
-            #X_temp = torch.zeros_like(X)
-            #for b_idx in range(b):
-            #    for node_idx in range(n):
-            #        index_one = np.random.choice(np.arange(self.num_node_type+1),p=X[b_idx,node_idx,:].detach().cpu().numpy())
-            #        X_temp[b_idx,node_idx,index_one] = 1.
-            X_temp = X
+            X_temp = torch.zeros_like(X)
+            for b_idx in range(b):
+                for node_idx in range(n):
+                    index_one = np.random.choice(np.arange(self.num_node_type+1),p=X[b_idx,node_idx,:].detach().cpu().numpy())
+                    X_temp[b_idx,node_idx,index_one] = 1.
                     
             visited_edges_temp = torch.zeros_like(visited_edges)
             for b_idx in range(b):
@@ -557,8 +532,7 @@ class Generator_DeConv(nn.Module):
                     index_one = np.random.choice(np.arange(self.num_edge_type+1),p=visited_edges[b_idx,edge_idx,:].detach().cpu().numpy())
                     visited_edges_temp[b_idx,edge_idx,index_one] = 1.
             edge_attr_temp = visited_edges_temp
-            #edge_attr_temp = torch.cat([edge_attr_temp,edge_attr_temp],dim=1) #[b, 2*alledges,# edge type+1]
-            
+            edge_attr_temp = torch.cat([edge_attr_temp,edge_attr_temp],dim=1) #[b, 2*alledges,# edge type+1]
             #compute the log probability of generation
             log_prob_temp = torch.sum(torch.sum(torch.log(X+SMALL_NUMBER) * X_temp,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(visited_edges+SMALL_NUMBER) * visited_edges_temp,dim=-1),dim=-1) #[b,]
 
@@ -591,31 +565,10 @@ class Generator_DeConv(nn.Module):
             X_list = []
             visited_edges_list = []
             log_prob_list = []
-
-            #The following case is deterministic: the first node is input and the last node is ouput
-            #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
-            # and 0,1 for input and ouput
-            #out_nodes_mask = torch.zeros_like(out_nodes)
-            #out_nodes_mask[:,:,1] = -LARGE_NUMBER
-            #out_nodes_mask[:,0,1] = LARGE_NUMBER
-            #out_nodes_mask[:,:,2] = -LARGE_NUMBER
-            #out_nodes_mask[:,n-1,2] = LARGE_NUMBER
-
             #X = F.gumbel_softmax(out_nodes, tau=temperature, hard=True, dim=-1).detach() #[b, n, # node type+1]
-            #X_probs = F.softmax(out_nodes + out_nodes_mask,dim=-1).detach() #[b, n, # node type+1]
-            #X_probs is fixed, i.e., #X = tensor([[0,1,0,0,0],[0,0,1,0,0],[0,0,0,1,0],[0,0,0,0,1]]) [b,4,5]
-            X_probs = []
-            for j in range(1,self.max_nodes+1):
-                node_label = data_utils_NASBench_201.onehot(j,self.max_nodes+1)
-                X_probs.append(node_label)
-            X_probs = torch.tensor(X_probs).float().view(1,n,-1).repeat(b,1,1) #[b,4,5]
-            
-            #out_edge_probs = F.softmax(out_edge,dim=-1).detach() #[b, # all edge, # edge type+1]
-            #the 0-index dim is fixed to zero
-            out_edge_mask = torch.zeros_like(out_edge)
-            out_edge_mask[:,:,0] = -LARGE_NUMBER
-            #reparameterization
-            out_edge_probs = F.softmax(out_edge + out_edge_mask,dim=-1).detach() #[b, # all edge, # edge type+1]
+            X_probs = F.softmax(out_nodes,dim=-1).detach() #[b, n, # node type+1]
+            #visited_edges = F.gumbel_softmax(out_edge, tau=temperature, hard=True, dim=-1).detach() #[b, # all edge, # edge type+1]
+            out_edge_probs = F.softmax(out_edge,dim=-1).detach() #[b, # all edge, # edge type+1]
 
             for decode_idx in range(decode_times):
                 X_temp = torch.zeros_like(X_probs)
@@ -656,39 +609,20 @@ class Generator_DeConv(nn.Module):
             log_prob = torch.cat(log_prob) #[b,]   
 
         else:
-            X_list,visited_edges_list = [], []
-            #The following case is deterministic: the first node is input and the last node is ouput
-            #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
-            # and 0,1 for input and ouput
-            #out_nodes_mask = torch.zeros_like(out_nodes)
-            #out_nodes_mask[:,:,1] = -LARGE_NUMBER
-            #out_nodes_mask[:,0,1] = LARGE_NUMBER
-            #out_nodes_mask[:,:,2] = -LARGE_NUMBER
-            #out_nodes_mask[:,n-1,2] = LARGE_NUMBER
+            index_x = out_nodes.max(-1, keepdim=True)[1]
+            X = torch.zeros_like(out_nodes).scatter_(-1, index_x, 1.0)
 
-            #out_nodes = out_nodes + out_nodes_mask
-            #index_x = out_nodes.max(-1, keepdim=True)[1]
-            #X = torch.zeros_like(out_nodes).scatter_(-1, index_x, 1.0)
-            #X is fixed, i.e., #X = tensor([[0,1,0,0,0],[0,0,1,0,0],[0,0,0,1,0],[0,0,0,0,1]]) [b,4,5]
-            X = []
-            for j in range(1,self.max_nodes+1):
-                node_label = data_utils_NASBench_201.onehot(j,self.max_nodes+1)
-                X.append(node_label)
-            X = torch.tensor(X).float().view(1,n,-1).repeat(b,1,1) #[b,4,5]
-
-            out_edge_mask = torch.zeros_like(out_edge)
-            out_edge_mask[:,:,0] = -LARGE_NUMBER
-            index_edge = (out_edge + out_edge_mask).max(-1, keepdim=True)[1]
+            index_edge = out_edge.max(-1, keepdim=True)[1]
             visited_edges = torch.zeros_like(out_edge).scatter_(-1, index_edge, 1.0)
 
             #compute the log probability of generation
-            log_prob = torch.sum(torch.sum(torch.log(torch.softmax(X,dim=-1)+SMALL_NUMBER) * X,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(torch.softmax(out_edge + out_edge_mask,dim=-1)+SMALL_NUMBER) * visited_edges,dim=-1),dim=-1) #[b,]
+            log_prob = torch.sum(torch.sum(torch.log(torch.softmax(out_nodes,dim=-1)+SMALL_NUMBER) * X,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(torch.softmax(out_edge,dim=-1)+SMALL_NUMBER) * visited_edges,dim=-1),dim=-1) #[b,]
         
     
-        edge_index = all_edges.long().to(self.device).view(2,-1)
-        #edge_index = edge_index[[0,1,1,0]].view(2,-1)
+        edge_index = all_edges.long().to(self.device)
+        edge_index = edge_index[[0,1,1,0]].view(2,-1)
         edge_attr = visited_edges.to(self.device)
-        #edge_attr = torch.cat([edge_attr,edge_attr],dim=1) #[b, 2*alledges,# edge type+1]
+        edge_attr = torch.cat([edge_attr,edge_attr],dim=1) #[b, 2*alledges,# edge type+1]
         
         
         graphs = []
@@ -774,11 +708,11 @@ class TrainVAE():
                 #print(z.size(),encoder_out_mu.size(),encoder_out_logvar.size())
                 [nodes_labels, edge_index, edge_attr, active_nodes, active_edges, batch], _, _ = self.generator.forward_prob_temp(z, temperature=temperature, use_random=use_random,use_hard=False)
                 #print(nodes_labels.size(),active_nodes.size())
-                fake_x = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1).view(batch_size,-1,self.generator.num_node_type+1) #[b,n,1+d]
-                fake_attr = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1).view(batch_size,-1,self.generator.num_edge_type+1) #[b,n*(n-1),1+d]
+                fake_x = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1).view(batch_size,self.generator.max_nodes,-1) #[b,n,1+d]
+                fake_attr = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1).view(batch_size,self.generator.max_nodes*(self.generator.max_nodes-1),-1) #[b,n*(n-1),1+d]
                 
-                real_x = tools.to_dense_batch(batch_data.x, max_num_nodes=self.generator.max_nodes, batch=batch_data.batch, fill_value=0).view(batch_size,-1,self.generator.num_node_type+1) #[b,n,1+d]
-                real_attr = tools.to_dense_adj(batch_data.edge_index, max_num_nodes=self.generator.max_nodes, batch=batch_data.batch, edge_attr=batch_data.edge_attr).view(batch_size,-1,self.generator.num_edge_type+1) #[b,n*(n-1),1+d]
+                real_x = tools.to_dense_batch(batch_data.x, max_num_nodes=self.generator.max_nodes, batch=batch_data.batch, fill_value=0).view(batch_size,self.generator.max_nodes,-1) #[b,n,1+d]
+                real_attr = tools.to_dense_adj(batch_data.edge_index, max_num_nodes=self.generator.max_nodes, batch=batch_data.batch, edge_attr=batch_data.edge_attr).view(batch_size,self.generator.max_nodes*(self.generator.max_nodes-1),-1) #[b,n*(n-1),1+d]
 
                 loss_rec = torch.sum(torch.sum(torch.log(fake_x+SMALL_NUMBER) * real_x,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(fake_attr+SMALL_NUMBER) * real_attr,dim=-1),dim=-1)
                 #loss_rec = torch.prod(torch.prod(torch.pow(fake_x,real_x),dim=-1),dim=-1) * torch.prod(torch.prod(torch.pow(fake_attr,real_attr),dim=-1),dim=-1) #[b,]
@@ -798,36 +732,32 @@ class TrainVAE():
                 A_list = [torch.eye(batch_size*self.generator.max_nodes), A]
                 #print("A[row, col]=",A[row, col],A[row, col].sum())
                 for _ in range(2,self.generator.max_nodes):
-                    A_mm = torch.mm(A_list[-1],A)
+                    A_mm = torch.mm(A_list[-1],A.T)
                     #print("A_mm[row, col]=",A_mm[row, col],A_mm[row, col].sum())
                     A_temp = torch.zeros_like(A_mm)
                     A_temp[row, col] = 1. / (1. + (a * ( A_mm[row, col] - 0.5)).exp())
                     #print("A_temp=",A_temp)
                     #print("A_temp[row, col]=",A_temp[row, col],A_temp[row, col].sum())
                     A_list.append(A_temp)
-                                
-                sum_A = sum(A_list)
-                C = 1. / (1. + (a * (sum_A[row, col] - 0.5)).exp())
+                
+                C = 1. / (1. + (a * (sum(A_list)[row, col] - 0.5)).exp())
                 
                 #print("C=",C,C.sum())
-
-                x_idx = torch.arange(batch_size*self.generator.max_nodes).long()
-                input_idx = (torch.arange(0,batch_size*self.generator.max_nodes,self.generator.max_nodes).float().view(batch_size,1)*torch.ones(batch_size,self.generator.max_nodes)).view(-1).long()
-                output_idx = (torch.arange(self.generator.max_nodes-1,batch_size*self.generator.max_nodes,self.generator.max_nodes).float().view(batch_size,1)*torch.ones(batch_size,self.generator.max_nodes)).view(-1).long()
-
-                C_input = 1. / (1. + (a * (sum_A[input_idx, x_idx] - 0.5)).exp())
-                C_output = 1. / (1. + (a * (sum_A[x_idx, output_idx] - 0.5)).exp())
-                #print(active_nodes.view(-1))
-                #print(sum(C_input),sum(C_output))
-
-                loss_reg_connect_indeg = active_nodes.view(-1) * (1. - C_input) + (1. - active_nodes.view(-1)) * scatter_add(C, col, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes))
-                loss_reg_connect_outdeg = active_nodes.view(-1) * (1. - C_output) + (1. - active_nodes.view(-1)) * scatter_add(C, row, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes))
-                #print("scatter_add(C, col, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes)=",scatter_add(C, col, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes)))
-                #print("scatter_add(C, row, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes)=",scatter_add(C, row, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes)))
-
-                loss_reg_connect = loss_reg_connect_indeg[loss_reg_connect_indeg>SMALL_NUMBER].sum()
-
-                loss_reg_valid = loss_reg_connect_outdeg[loss_reg_connect_outdeg>SMALL_NUMBER].sum()
+                
+                loss_reg_connect = active_nodes[row] * active_nodes[col] * (1. - C) + (1. - active_nodes[row] * active_nodes[col]) * C
+                loss_reg_connect = loss_reg_connect[loss_reg_connect>SMALL_NUMBER].sum()
+                
+                #the validity constraint
+                U = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1) * torch.tensor([0.]+list(dataset_info(self.generator.dataset)['maximum_valence'].values())).float().view(1,-1).to(self.generator.device) #[b * n, # node type +1]
+                U = torch.sum(U,dim=-1) #[b*n,]
+                
+                V = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1) * torch.tensor([0.]+list(dataset_info(self.generator.dataset)['bond'].values())).float().view(1,-1).to(self.generator.device)
+                V = torch.sum(V,dim=-1) #[b*m,]
+                
+                V = scatter_add(V, edge_index[1], dim=0, out=torch.zeros(batch_size*self.generator.max_nodes,)) #[b*n,]
+                
+                C_val = V-U
+                loss_reg_valid = C_val[C_val>SMALL_NUMBER].sum()
                 
                 loss = loss_elbo + self.lam_2 * loss_reg_valid + self.lam_3 * loss_reg_connect
                 #loss = loss_elbo + loss_reg_valid + loss_reg_connect
@@ -846,11 +776,11 @@ class TrainVAE():
             print("training vae : epoch %s, total loss: %.5f, elbo: %.5f [kl: %.5f, recon: %.5f], connect: %.5f, valid: %.5f | time cost: %.2f" % (epoch+1,loss.item(),loss_elbo.item(),loss_kl.mean().item(),-loss_rec.mean().item(),loss_reg_connect.item(),loss_reg_valid.item(), time.time()-train_time),end="\n")
 
 
-            pl.plot(loss_store["total_loss"],'k')
-            pl.plot(loss_store["elbo_loss"],'r')
-            pl.legend(["total_loss","elbo_loss"])
-            #pl.savefig("vae_log_loss.png")
-            pl.close()
+        pl.plot(loss_store["total_loss"],'k')
+        pl.plot(loss_store["elbo_loss"],'r')
+        pl.legend(["total_loss","elbo_loss"])
+        #pl.savefig("vae_log_loss.png")
+        pl.close()
 
 
 
@@ -898,7 +828,7 @@ class TrainGenerator():
         data_set_copy = real_data
         batch_size_vae = min(int(len(data_set_copy)/2),batch_size_vae) #choose best 1/2 to train 
         #sort data
-        data_set_copy.data_list.sort(key=lambda d:d.y[:],reverse=True)
+        data_set_copy.data_list.sort(key=lambda d:d.y[:,TASK_NO],reverse=True)
         #data_set_copy.cut(0,min(len(data_set_copy)/2,batch_size_vae)) #choose best 1/2 to train 
 
         total_time_start = time.time()
@@ -964,11 +894,11 @@ class TrainGenerator():
                 z = vaeencoder.reparameterize(encoder_out_mu, encoder_out_logvar)
                 #print(z.size(),encoder_out_mu.size(),encoder_out_logvar.size())
                 [nodes_labels, edge_index, edge_attr, active_nodes, active_edges, batch], _, _ = generator.forward_prob_temp(z, temperature=temperature, use_random=use_random, use_hard=False)
-                fake_x = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1).view(batch_size_vae,-1,generator.num_node_type+1) #[b,n,1+d]
-                fake_attr = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1).view(batch_size_vae,-1,generator.num_edge_type+1) #[b,n*(n-1),1+d]
+                fake_x = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1).view(batch_size_vae,generator.max_nodes,-1) #[b,n,1+d]
+                fake_attr = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1).view(batch_size_vae,generator.max_nodes*(generator.max_nodes-1),-1) #[b,n*(n-1),1+d]
                 
-                real_x = tools.to_dense_batch(batch_data.x, max_num_nodes=generator.max_nodes, batch=batch_data.batch, fill_value=0).view(batch_size_vae,-1,generator.num_node_type+1) #[b,n,1+d]
-                real_attr = tools.to_dense_adj(batch_data.edge_index, max_num_nodes=generator.max_nodes, batch=batch_data.batch, edge_attr=batch_data.edge_attr).view(batch_size_vae,-1,generator.num_edge_type+1) #[b,n*(n-1),1+d]
+                real_x = tools.to_dense_batch(batch_data.x, max_num_nodes=generator.max_nodes, batch=batch_data.batch, fill_value=0).view(batch_size_vae,generator.max_nodes,-1) #[b,n,1+d]
+                real_attr = tools.to_dense_adj(batch_data.edge_index, max_num_nodes=generator.max_nodes, batch=batch_data.batch, edge_attr=batch_data.edge_attr).view(batch_size_vae,generator.max_nodes*(generator.max_nodes-1),-1) #[b,n*(n-1),1+d]
                 
                 loss_rec = torch.sum(torch.sum(torch.log(fake_x+SMALL_NUMBER) * real_x,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(fake_attr+SMALL_NUMBER) * real_attr,dim=-1),dim=-1)
                 #loss_rec = torch.prod(torch.prod(torch.pow(fake_x,real_x),dim=-1),dim=-1) * torch.prod(torch.prod(torch.pow(fake_attr,real_attr),dim=-1),dim=-1) #[b,]
@@ -1010,31 +940,34 @@ class TrainGenerator():
                 A_list = [torch.eye(batch_size*generator.max_nodes), A]
                 #print("A[row, col]=",A[row, col],A[row, col].sum())
                 for _ in range(2,generator.max_nodes):
-                    A_mm = torch.mm(A_list[-1],A)
+                    A_mm = torch.mm(A_list[-1],A.T)
                     #print("A_mm[row, col]=",A_mm[row, col],A_mm[row, col].sum())
                     A_temp = torch.zeros_like(A_mm)
                     A_temp[row, col] = 1. / (1. + (a * ( A_mm[row, col] - 0.5)).exp())
                     #print("A_temp=",A_temp)
                     #print("A_temp[row, col]=",A_temp[row, col],A_temp[row, col].sum())
                     A_list.append(A_temp)
-                sum_A = sum(A_list)
-                C = 1. / (1. + (a * (sum_A[row, col] - 0.5)).exp())
                 
-                #print("C=",C,C.sum())
-
-                x_idx = torch.arange(batch_size*generator.max_nodes).long()
-                input_idx = (torch.arange(0,batch_size*generator.max_nodes,generator.max_nodes).float().view(batch_size,1)*torch.ones(batch_size,generator.max_nodes)).view(-1).long()
-                output_idx = (torch.arange(generator.max_nodes-1,batch_size*generator.max_nodes,generator.max_nodes).float().view(batch_size,1)*torch.ones(batch_size,generator.max_nodes)).view(-1).long()
-
-                C_input = 1. / (1. + (a * (sum_A[input_idx, x_idx] - 0.5)).exp())
-                C_output = 1. / (1. + (a * (sum_A[x_idx, output_idx] - 0.5)).exp())
-
-                loss_reg_connect_indeg = active_nodes.view(-1) * (1. - C_input) + (1. - active_nodes.view(-1)) * scatter_add(C, col, dim=0, out=torch.zeros(batch_size*generator.max_nodes))
-                loss_reg_connect_outdeg = active_nodes.view(-1) * (1. - C_output) + (1. - active_nodes.view(-1)) * scatter_add(C, row, dim=0, out=torch.zeros(batch_size*generator.max_nodes))
-
-                loss_reg_connect = loss_reg_connect_indeg[loss_reg_connect_indeg>SMALL_NUMBER].sum()
-                loss_reg_valid = loss_reg_connect_outdeg[loss_reg_connect_outdeg>SMALL_NUMBER].sum()
-
+                C = 1. / (1. + (a * (sum(A_list)[row, col] - 0.5)).exp())
+                
+                print("C=",C,C.sum())
+                
+                loss_reg_connect = active_nodes[row] * active_nodes[col] * (1. - C) + (1. - active_nodes[row] * active_nodes[col]) * C
+                loss_reg_connect = loss_reg_connect[loss_reg_connect>SMALL_NUMBER].sum()
+                
+                #the validity constraint
+                U = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1) * torch.tensor([0.]+list(dataset_info(generator.dataset)['maximum_valence'].values())).float().view(1,-1).to(generator.device) #[b * n, # node type +1]
+                U = torch.sum(U,dim=-1) #[b*n,]
+                
+                V = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1) * torch.tensor([0.]+list(dataset_info(generator.dataset)['bond'].values())).float().view(1,-1).to(generator.device)
+                V = torch.sum(V,dim=-1) #[b*m,]
+                
+                V = scatter_add(V, edge_index[1], dim=0, out=torch.zeros(batch_size*generator.max_nodes,)) #[b*n,]
+                
+                C_val = V-U
+                loss_reg_valid = C_val[C_val>SMALL_NUMBER].sum()
+                
+            
             total_loss = self.lam_1 * loss_exp + self.lam_2 * loss_reg_valid + self.lam_3 * loss_reg_connect + loss_elbo
             #total_loss =  self.lam_2 * loss_reg_valid + self.lam_3 * loss_reg_connect
             
@@ -1085,11 +1018,11 @@ class TrainGenerator():
         
         #pl.plot(loss_store["loss_d"],'b')
         #pl.plot(loss_store["loss_g"],'g')
-        pl.plot(loss_store["loss_exp"],'r')
-        pl.plot(loss_store["loss_reg_valid"],'c')
-        pl.plot(loss_store["loss_reg_connect"],'y')
-        pl.plot(loss_store["total_loss"],'k')
-        pl.legend(["loss_exp",'loss_reg_valid',"loss_reg_connect","total_loss"])
+        #pl.plot(loss_store["loss_exp"],'r')
+        #pl.plot(loss_store["loss_reg_valid"],'c')
+        #pl.plot(loss_store["loss_reg_connect"],'y')
+        #pl.plot(loss_store["total_loss"],'k')
+        #pl.legend(["loss_exp",'loss_reg_valid',"loss_reg_connect","total_loss"])
         #pl.show()
         #pl.savefig("gen_score_log.png")
         #pl.close()
@@ -1173,7 +1106,7 @@ class TrainSurrogate():
                 
                 labels_pre = self.surrogate.predictor(encoder_out_mu)
             
-                loss_pre = self.mseloss_fn(batch.y[:].view(-1),labels_pre.view(-1))
+                loss_pre = self.mseloss_fn(batch.y[:,TASK_NO].view(-1),labels_pre.view(-1))
                 
                 loss_pre.backward()
                 optimizer.step()
@@ -1185,6 +1118,7 @@ class TrainSurrogate():
                 epoch_time = time.time() - total_time_start
                 if (epoch+1)%50 == 0 or num_epochs < 50 or step % 50 == 0:
                     print("training surrogate : epoch %s batch %s (has %s graphs), loss: %.5f| time cost: %.2f" % (epoch+1, step, batch.num_graphs, loss/processed_graphs, epoch_time),end="\r")
+                    #print("left-real,right-pre",torch.cat([batch.y[:,TASK_NO].view(-1,1),labels_pre.view(-1,1)],-1))
 
     
             loss_store.append(loss/processed_graphs)
@@ -1206,11 +1140,11 @@ class TrainSurrogate():
             data_loader = DataLoader(valid, batch_size=len(valid), shuffle=False)
             for batch in data_loader:
                 
-                pre_mu, pre_sigma2, rmse_mc, test_ll = self.surrogate.predict(batch.x, batch.edge_index, batch.edge_attr, batch.batch, 10, uncertainty=True, tau=tau, y_test=batch.y[:].view(-1))
+                pre_mu, pre_sigma2, rmse_mc, test_ll = self.surrogate.predict(batch.x, batch.edge_index, batch.edge_attr, batch.batch, 10, uncertainty=True, tau=tau, y_test=batch.y[:,TASK_NO].view(-1))
 
-                pre_mu_wo, _, rmse, _ = self.surrogate.predict(batch.x, batch.edge_index, batch.edge_attr, batch.batch, None, uncertainty=False, tau=None, y_test=batch.y[:].view(-1))
+                pre_mu_wo, _, rmse, _ = self.surrogate.predict(batch.x, batch.edge_index, batch.edge_attr, batch.batch, None, uncertainty=False, tau=None, y_test=batch.y[:,TASK_NO].view(-1))
         
-                print("real=",batch.y[:].view(-1))
+                print("real=",batch.y[:,TASK_NO].view(-1))
                 print("pre_mu_wo=",pre_mu_wo.view(-1))
                 print("pre_mu=",pre_mu.view(-1))
                 print("pre_sigma2=",pre_sigma2)
@@ -1218,13 +1152,13 @@ class TrainSurrogate():
                 print("test loss=",rmse_mc)
         
         
-            pl.scatter(torch.linspace(1,len(valid),len(valid)).numpy(),batch.y[:].view(-1).numpy(),c='k',alpha=0.5)
+            pl.scatter(torch.linspace(1,len(valid),len(valid)).numpy(),batch.y[:,TASK_NO].view(-1).numpy(),c='k',alpha=0.5)
             pl.scatter(torch.linspace(1,len(valid),len(valid)).numpy(),pre_mu_wo.view(-1).detach().numpy(),c='b',alpha=0.5)
             pl.errorbar(torch.linspace(1,len(valid),len(valid)).numpy(),pre_mu.detach().numpy(),yerr=torch.sqrt(pre_sigma2.detach()).numpy(),c='r',alpha=0.5,ecolor='g',capsize=3)
             pl.savefig("eval_surr_%s.png"%name)
             pl.close()
     
-            return self.mseloss_fn(batch.y[:].view(-1),pre_mu.view(-1)).item()
+            return self.mseloss_fn(batch.y[:,TASK_NO].view(-1),pre_mu.view(-1)).item()
 
 
 #==============================================================================
@@ -1520,6 +1454,7 @@ class GenCandidates():
             print("generate_candidates_randomly")
             exit(1)
     
+    
     def generate_candidates(self, generator, Z=None, key=None, filter_flag=True, num_gen=100, use_random=False):
         
         print("generating the candidates")
@@ -1541,12 +1476,12 @@ class GenCandidates():
             #print("in=",[x, edge_index, edge_attr, active_nodes, active_edges])
             
             x_sparse = x[active_nodes>0].view(-1,generator.num_node_type)
-            #print(x[-1,:],active_nodes)
+            
             # print(edge_index.size(1),edge_attr.size(0))
             
             edge_index_sparse_old = edge_index[:,active_edges>0]
-            edge_attr_sparse_old = edge_attr[active_edges>0]        
-
+            edge_attr_sparse_old = edge_attr[active_edges>0]
+            
             #print("edge_index_sparse_old=",edge_index_sparse_old)
             
             #node hash
@@ -1562,15 +1497,13 @@ class GenCandidates():
                     edge_attr_sparse_filtered.append(edge_attr_sparse_old[idx].view(1,-1))
             # print(len(edge_index_sparse_filtered),len(edge_attr_sparse_filtered))
             edge_index_sparse_filtered = torch.tensor(edge_index_sparse_filtered).t().long()
-            #print("edge_index_sparse_filtered=",edge_index_sparse_filtered)
-
+            
             nodes_idx_filtered=[]
             if len(edge_index_sparse_filtered)>0:
                 #remove the ghost nodes
                 for idx in nodes_idx:
-                    if idx in edge_index_sparse_filtered[0] or idx in edge_index_sparse_filtered[1]:
+                    if idx in edge_index_sparse_filtered[0]:
                         nodes_idx_filtered.append(idx)
-                #print(nodes_idx_filtered)
                 x_sparse = x[nodes_idx_filtered,:]
             
             
@@ -1590,15 +1523,9 @@ class GenCandidates():
             #print("edge_index_sparse=",edge_index_sparse)
             #print(edge_attr_sparse.size(0),edge_index_sparse.size(1))
             #assert edge_attr_sparse.size(0)==edge_index_sparse.size(1)
-                        
-            n=x_sparse.size(0)
-            MAX_NODES=x.size(0)
-            if n < MAX_NODES:
-                #padding zeros into x to ensure the first node is input and the 20th one is output
-                x_sparse=torch.cat([x_sparse[0:n-1,:],torch.zeros(MAX_NODES-n,x_sparse.size(1)),x_sparse[n-1,:].view(1,-1)],dim=0)
-                edge_index_sparse[edge_index_sparse==n-1]=MAX_NODES-1
             
             graphs_sparse.append([x_sparse,edge_index_sparse.long(),edge_attr_sparse,log_prob])
+
             print("%s/%s"%(count,Z.size(0)),end='\r')
     
             #print("graph=",[x_sparse,edge_index_sparse,edge_attr_sparse],edge_index_sparse_old,nodes_idx,active_edges)
@@ -1607,30 +1534,26 @@ class GenCandidates():
         generator.train()
         
         if filter_flag:
-            #return self.is_valid(graphs_sparse)
-            return self.is_valid_NASBench201(graphs_sparse)
+            return self.filter(graphs_sparse,key=key)
         else:
             return graphs_sparse
     
     def init_observed_data(self, dataset):
         #init mols with observed_graphs
         for d in dataset:
-            """
             mol = to_mol({'x':d.x,'edge_index':d.edge_index,'edge_attr':d.edge_attr},dataset=self.dataset)
             if mol is None:
                 new_mol = ""
             else:
                 new_mol=Chem.MolToSmiles(mol)
             self.observed_data["mol"].append(new_mol)
-            """
-            self.observed_data["y"].append(d.y[0])
+            self.observed_data["y"].append(d.y[0,TASK_NO])
 
     def update_observed_data(self,new_graphs,ys):
         #init mols with observed_graphs
         count=-1
         for g in new_graphs:
             count+=1
-            """
             mol = to_mol({'x':g[0],'edge_index':g[1],'edge_attr':g[2]},dataset=self.dataset)
             #mol = to_mol({'x':d.x,'edge_index':d.edge_index,'edge_attr':d.edge_attr})
             if mol is None:
@@ -1638,62 +1561,8 @@ class GenCandidates():
             else:
                 new_mol=Chem.MolToSmiles(mol)
             self.observed_data["mol"].append(new_mol)
-            """
             self.observed_data["y"].append(ys[count]["y"])
     
-    def is_valid(self,graphs):
-        filtered_graphs = []
-        for g in graphs:
-            #print("haha",g)
-            x_sparse,edge_index_sparse,edge_attr_sparse,_ = g
-
-            if x_sparse.size(0) == 0:
-                print("non-valid due to [x_sparse.size(0) == 0]")
-                continue
-            #the first is input and last is output and #only one input and only one output
-            if x_sparse[0][0] == 1 and x_sparse[x_sparse.size(0)-1][1] == 1 and sum(x_sparse[:,0])==1 and sum(x_sparse[:,1])==1:
-                valid_nodes_from_edges = list(set(list(edge_index_sparse[0].numpy())+list(edge_index_sparse[1].numpy())))      
-                print("nodes=",valid_nodes_from_edges)
-                DG = nx.DiGraph()
-                nodes=[int(n) for n in valid_nodes_from_edges]
-                flag_nodes=True
-                for n in nodes:
-                    if len(x_sparse[n].nonzero().view(-1))==0:
-                        print("non-valid due to [len(x_sparse[n].nonzero().view(-1))==0]")
-                        flag_nodes=False
-                        break
-                if flag_nodes==False or 0 not in nodes or int(x_sparse.size(0)-1) not in nodes:
-                    print("non-valid due to [flag_nodes==False]")
-                    continue
-                #print(n,"add",int(x_sparse[n].nonzero().view(-1)[0]))
-                #DG[n]['x_label']=int(x_sparse[n].nonzero().view(-1)[0])
-                    
-
-                DG.add_edges_from([(int(edge[0]),int(edge[1])) for edge in edge_index_sparse.t().numpy()])
-                print("edges=",DG.edges())
-                res_con_first=[]
-                res_con_last=[]
-                for node in nodes:
-                    #node 0 connect to any one
-                    if node != 0:
-                        res_con_first.append(nx.node_connectivity(DG, 0, node) ) 
-                    #any one connect to node n-1
-                    if node != int(x_sparse.size(0)-1):
-                        res_con_last.append(nx.node_connectivity(DG, node, int(x_sparse.size(0)-1)))
-
-                print("connection check: 0->x:",res_con_first,"x->n-1:",res_con_last)
-                if 0 not in res_con_first and 0 not in res_con_last:
-                    print("valid +1")
-                    filtered_graphs.append(g)
-                else:
-                    print("non-valid due to [0 in res_con_first or 0 in res_con_first]")
-
-        print("valid size=",len(filtered_graphs),"/",len(graphs))
-        return filtered_graphs
-
-    def is_valid_NASBench201(self,graphs):
-        return graphs
-
     def filter(self, graphs, key=None):
         mols = []
         #filtering
@@ -1763,7 +1632,7 @@ class ChooseNext():
         self.y_observed=None
     
     def next(self, candidates, acq_type):
-        best_one_idx = self.do_search_speedup(candidates, acq_type=acq_type, walkers=8)
+        best_one_idx = self.do_search_speedup(candidates, acq_type=acq_type, walkers=4)
         return [candidates[best_one_idx]],best_one_idx
 
     def score_one_can_Rand(self, d):
@@ -1895,172 +1764,7 @@ class testGenerativeQuality():
         #self.max = 2.0
         self.min = 0.0
         self.max = 1.0
-        self.start_time = time.time()
 
-    def evaluate_NN(self,input_g):
-        res = objective_func.evaluate_point(input_g)
-        return res
-    
-    #convert graph to string representation in NASBench201
-    def get_archstr(self,input_g):
-        x = input_g[0]
-        edge_index = input_g[1]
-        edge_attr = input_g[2]
-        
-        def idx2opsstr(idx):
-            ops_str_list = ["none","skip_connect","nor_conv_1x1","nor_conv_3x3","avg_pool_3x3"]
-            return ops_str_list[idx]
-        
-        op_str_1_0 = idx2opsstr(torch.nonzero(edge_attr[0]).item()) #0->1
-        op_str_2_0 = idx2opsstr(torch.nonzero(edge_attr[1]).item()) #0->2
-        op_str_2_1 = idx2opsstr(torch.nonzero(edge_attr[3]).item()) #1->2
-        op_str_3_0 = idx2opsstr(torch.nonzero(edge_attr[2]).item()) #0->3
-        op_str_3_1 = idx2opsstr(torch.nonzero(edge_attr[4]).item()) #1->3
-        op_str_3_2 = idx2opsstr(torch.nonzero(edge_attr[5]).item()) #2->3
-        
-        arch_str = '|%s~0|+|%s~0|%s~1|+|%s~0|%s~1|%s~2|'%(op_str_1_0,op_str_2_0,op_str_2_1,op_str_3_0,op_str_3_1,op_str_3_2)
-    
-        return arch_str
-
-    # This function is to mimic the training and evaluatinig procedure for a single architecture `arch`.
-    # The time_cost is calculated as the total training time for a few (e.g., 12 epochs) plus the evaluation time for one epoch.
-    # For use_012_epoch_training = True, the architecture is trained for 12 epochs, with LR being decaded from 0.1 to 0.
-    #       In this case, the LR schedular is converged.
-    # For use_012_epoch_training = False, the architecture is planed to be trained for 200 epochs, but we early stop its procedure.
-    #       
-    def train_and_eval(self, arch, nas_bench, extra_info, dataname='cifar10-valid', use_012_epoch_training=True):
-
-        if use_012_epoch_training and nas_bench is not None:
-            arch_index = nas_bench.query_index_by_arch( arch )
-            assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
-            info = nas_bench.get_more_info(arch_index, dataname, None, True)
-            valid_acc, time_cost = info['valid-accuracy'], info['train-all-time'] + info['valid-per-time']
-            #_, valid_acc = info.get_metrics('cifar10-valid', 'x-valid' , 25, True) # use the validation accuracy after 25 training epochs
-        elif not use_012_epoch_training and nas_bench is not None:
-            # Please contact me if you want to use the following logic, because it has some potential issues.
-            # Please use `use_012_epoch_training=False` for cifar10 only.
-            # It did return values for cifar100 and ImageNet16-120, but it has some potential issues. (Please email me for more details)
-            arch_index, nepoch = nas_bench.query_index_by_arch( arch ), 25
-            assert arch_index >= 0, 'can not find this arch : {:}'.format(arch)
-            xoinfo = nas_bench.get_more_info(arch_index, 'cifar10-valid', None, True)
-            xocost = nas_bench.get_cost_info(arch_index, 'cifar10-valid', False)
-            info = nas_bench.get_more_info(arch_index, dataname, nepoch, False, True) # use the validation accuracy after 25 training epochs, which is used in our ICLR submission (not the camera ready).
-            cost = nas_bench.get_cost_info(arch_index, dataname, False)
-            # The following codes are used to estimate the time cost.
-            # When we build NAS-Bench-201, architectures are trained on different machines and we can not use that time record.
-            # When we create checkpoints for converged_LR, we run all experiments on 1080Ti, and thus the time for each architecture can be fairly compared.
-            nums = {'ImageNet16-120-train': 151700, 'ImageNet16-120-valid': 3000,
-                    'cifar10-valid-train' : 25000,  'cifar10-valid-valid' : 25000,
-                    'cifar100-train'      : 50000,  'cifar100-valid'      : 5000}
-            estimated_train_cost = xoinfo['train-per-time'] / nums['cifar10-valid-train'] * nums['{:}-train'.format(dataname)] / xocost['latency'] * cost['latency'] * nepoch
-            estimated_valid_cost = xoinfo['valid-per-time'] / nums['cifar10-valid-valid'] * nums['{:}-valid'.format(dataname)] / xocost['latency'] * cost['latency']
-            try:
-                valid_acc, time_cost = info['valid-accuracy'], estimated_train_cost + estimated_valid_cost
-            except:
-                valid_acc, time_cost = info['valtest-accuracy'], estimated_train_cost + estimated_valid_cost
-        else:
-            # train a model from scratch.
-            raise ValueError('NOT IMPLEMENT YET')
-        return valid_acc, time_cost
-    
-    def evaluate_NASBench201(self,input_g):
-        #res = objective_func.evaluate_point(input_g)
-        #convert graph to string representation in NASBench201
-        arch_str = self.get_archstr(input_g)
-        print(">>>>>>>> eval archstr:\"%s\" ..."%arch_str)
-
-        index = api.query_index_by_arch(arch_str)
-        
-        print(">>>>>>>> hash in NASBench201, idx = %s"%index)
-        
-        use_12epoch=False
-        if use_12epoch :
-            valid_acc, time_cost = self.train_and_eval(arch_str, api, None, dataname=image_data, use_012_epoch_training=True)
-            res = -1.0*(1.-valid_acc/100.)
-            
-            #get test results at 12th epoch (not use in search)
-            if image_data == "cifar10-valid":
-                results_cifar10_12 = api.query_by_index(index, "cifar10", use_12epochs_result=True) # a dict of all trials, where the key is the seed
-                results_cifar100_12 = api.query_by_index(index, "cifar100", use_12epochs_result=True)
-                results_ImageNet16_120_12 = api.query_by_index(index, "ImageNet16-120", use_12epochs_result=True)
-            else:
-                #results_12 = api.query_by_index(index, image_data, use_12epochs_result=True) # a dict of all trials, where the key is the seed
-                print("eval [%s] data is still not implemented"%image_data)
-                exit(1)
-            
-            #get test results at 200th epoch (not use in search)
-            if image_data == "cifar10-valid":
-                results_cifar10_200 = api.query_by_index(index, "cifar10", use_12epochs_result=False) # a dict of all trials, where the key is the seed
-                results_cifar100_200 = api.query_by_index(index, "cifar100", use_12epochs_result=False) # a dict of all trials, where the key is the seed
-                results_ImageNet16_120_200 = api.query_by_index(index, "ImageNet16-120", use_12epochs_result=False) # a dict of all trials, where the key is the seed
-            else:
-                #results_200 = api.query_by_index(index, image_data, use_12epochs_result=False) # a dict of all trials, where the key is the seed
-                print("eval [%s] data is still not implemented"%image_data)
-                exit(1)
-            
-            test_acc_list_cifar10_12 = [results_cifar10_12[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_cifar10_12.keys())]
-            test_acc_list_cifar100_12 = [results_cifar100_12[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_cifar100_12.keys())]
-            test_acc_list_ImageNet16_120_12 = [results_ImageNet16_120_12[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_ImageNet16_120_12.keys())]
-            
-            test_acc_list_cifar10_200 = [results_cifar10_200[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_cifar10_200.keys())]
-            test_acc_list_cifar100_200 = [results_cifar100_200[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_cifar100_200.keys())]
-            test_acc_list_ImageNet16_120_200 = [results_ImageNet16_120_200[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results_ImageNet16_120_200.keys())]
-            
-            #get valid results at 200th epoch (not use in search)
-            results_cifar10_valid_200 = api.query_by_index(index, image_data) # a dict of all trials, where the key is the seed
-            cifar10_valid_accu_list_200 = [results_cifar10_valid_200[trial_seed_i].get_eval("x-valid")["accuracy"] for trial_seed_i in list(results_cifar10_valid_200.keys())]
-            results_cifar100_valid_200 = api.query_by_index(index, "cifar100") # a dict of all trials, where the key is the seed
-            cifar100_valid_accu_list_200 = [results_cifar100_valid_200[trial_seed_i].get_eval("x-valid")["accuracy"] for trial_seed_i in list(results_cifar100_valid_200.keys())]
-            results_ImageNet16_120_valid_200 = api.query_by_index(index, "ImageNet16-120") # a dict of all trials, where the key is the seed
-            ImageNet16_120_valid_accu_list_200 = [results_ImageNet16_120_valid_200[trial_seed_i].get_eval("x-valid")["accuracy"] for trial_seed_i in list(results_ImageNet16_120_valid_200.keys())]
-            
-            acc_info = {"cifar10":{"valid-200":cifar10_valid_accu_list_200,"test_12":test_acc_list_cifar10_12,"test_200":test_acc_list_cifar10_200},"cifar100":{"valid-200":cifar100_valid_accu_list_200,"test_12":test_acc_list_cifar100_12,"test_200":test_acc_list_cifar100_200},"ImageNet16-120":{"valid-200":ImageNet16_120_valid_accu_list_200,"test_12":test_acc_list_ImageNet16_120_12,"test_200":test_acc_list_ImageNet16_120_200}}
-            
-            print(">>>>>>>> get result in NASBench201, valid_error = %s (use in search), cost = %s, and acc_info = %s (not use in search, just test)"%(-res,time_cost,acc_info))
-        else:
-
-            """
-            Args [dataset] (4 possible options):
-            -- cifar10-valid : training the model on the CIFAR-10 training set.
-            -- cifar10 : training the model on the CIFAR-10 training + validation set.
-            -- cifar100 : training the model on the CIFAR-100 training set.
-            -- ImageNet16-120 : training the model on the ImageNet16-120 training set.
-            Args [setname] (each dataset has different setnames):
-            -- When dataset = cifar10-valid, you can use 'train', 'x-valid', 'ori-test'
-            ------ 'train' : the metric on the training set.
-            ------ 'x-valid' : the metric on the validation set.
-            ------ 'ori-test' : the metric on the test set.
-            -- When dataset = cifar10, you can use 'train', 'ori-test'.
-            ------ 'train' : the metric on the training + validation set.
-            ------ 'ori-test' : the metric on the test set.
-            -- When dataset = cifar100 or ImageNet16-120, you can use 'train', 'ori-test', 'x-valid', 'x-test'
-            ------ 'train' : the metric on the training set.
-            ------ 'x-valid' : the metric on the validation set.
-            ------ 'x-test' : the metric on the test set.
-            ------ 'ori-test' : the metric on the validation + test set.
-            """
-            results = api.query_by_index(index, image_data) # a dict of all trials, where the key is the seed
-            print ('>>>>>>>> there are {:} trials for this architecture on {:}'.format(len(results), image_data))
-            
-            valid_error_list = [1. - results[trial_seed_i].get_eval("x-valid")["accuracy"]/100. for trial_seed_i in list(results.keys())]
-        
-            #randomly choose one from multipy trials
-            res = -1.0*random.choice(valid_error_list)
-        
-            time_cost = 0.
-        
-            if image_data == "cifar10-valid":
-                results = api.query_by_index(index, "cifar10") # a dict of all trials, where the key is the seed
-
-            test_acc_list = [results[trial_seed_i].get_eval("ori-test")["accuracy"] for trial_seed_i in list(results.keys())]
-            
-            acc_info = test_acc_list
-            
-            print(">>>>>>>> get result in NASBench201, valid_error = %s (use in search), cost = %s, and acc_info = %s (not use in search, just test)"%(-res,time_cost,acc_info))
-        
-        return res, time_cost, arch_str, index, acc_info
-    
-    
     #recall the real evaluation function to evaluate
     def evaluate_point(self, input):
         if input["smiles"]=="":
@@ -2069,12 +1773,16 @@ class testGenerativeQuality():
             y = objective_func.evaluate_point(input,target=self.target)
             #y_normized = y
             #y_normized = (y-self.min)/(self.max-self.min)
-            y_normized = np.exp(y)
+            if target == 'joint':
+                y_normized = np.exp(y)
+            else:
+                y_normized = y
         return y_normized
 
     def denormalize(self,res_list):
         #res_list = [y_normalized * (self.max-self.min) + self.min for y_normalized in res_list]
-        res_list = [np.log(y_normalized) for y_normalized in res_list]
+        if target == 'joint':
+            res_list = [np.log(y_normalized) for y_normalized in res_list]
         return res_list
         
     def test(self, generated_graphs,store_flag=True):
@@ -2091,49 +1799,13 @@ class testGenerativeQuality():
                     if self.count == 1:
                         fieldnames = ["# eval", 'smiles', 'properties', time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))]
                         csvwriter.writerow(fieldnames)
-                    csvwriter.writerow([self.count, mol["smiles"], goal])
-        return goal_list
-    
-    def test_NN(self, generated_graphs,store_flag=True):
-        goal_list = []
-        for mol in generated_graphs:
-            goal = self.evaluate_NN(mol)
-            goal_list.append({"y":goal})
-            if store_flag:
-                self.count += 1
-                #save into csv file
-                with open(self.filename,"a",newline="") as datacsv:
-                    csvwriter = csv.writer(datacsv)
-                    if self.count == 1:
-                        fieldnames = ["# eval", 'time', 'properties', time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))]
-                        csvwriter.writerow(fieldnames)
-                    csvwriter.writerow([self.count, time.time()-self.start_time,goal])
-                with open('results/architecture_%s_%s_%s.pkl'%(model_name,self.count,int(opts.random_seed)), 'wb') as f:
-                    pickle.dump(mol, f)
-        return goal_list
-    
-    def test_NASBench201(self, generated_graphs,store_flag=True):
-        goal_list = []
-        for mol in generated_graphs:
-            goal, time_cost, arch_str, arch_index, test_acc_list = self.evaluate_NASBench201(mol)
-            goal_list.append({"y":goal})
-            if store_flag:
-                self.count += 1
-                #save into csv file
-                with open(self.filename,"a",newline="") as datacsv:
-                    csvwriter = csv.writer(datacsv)
-                    if self.count == 1:
-                        fieldnames = ["# eval", 'total_search_cost', 'one_eval_cost', 'properties', 'arch_str', 'arch_index','test_acc_list', time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))]
-                        csvwriter.writerow(fieldnames)
-                    csvwriter.writerow([self.count, time.time()-self.start_time, time_cost,goal,arch_str,arch_index,"%s"%test_acc_list])
-                #with open('results/architecture_%s_%s_%s.pkl'%(model_name,self.count,int(opts.random_seed)), 'wb') as f:
-                #    pickle.dump(mol, f)
+                    csvwriter.writerow([self.count, mol["smiles"], self.denormalize([goal])[0]])
         return goal_list
     
     def test_dataset(self,dataset):
         res = []
         for i in range(len(dataset)):
-            res.append(dataset[i].y[:].item())
+            res.append(dataset[i].y[:,TASK_NO].item())
         return res
     
     def draw_dist(self, res_list, ax, color, label):
@@ -2182,7 +1854,7 @@ class testGenerativeQuality():
 
 def draw_dis(generator,Z, count):
     can_test = genCan.generate_candidates(generator, Z=Z, filter_flag=False, num_gen=1000, use_random=use_random)
-    results_list = eval_mol.test_NN(can_test,store_flag=False)
+    results_list = eval_mol.test(can_test,store_flag=False)
     #print(results_list)
     res_list_filtered = []
     for re in results_list:
@@ -2203,48 +1875,120 @@ def draw_dis(generator,Z, count):
 #test
 if __name__ == "__main__":
     
+        fixed_Z = torch.randn(1000,input_dim)
+        
         input_dim_n=dataset_info(dataset_name)["num_node_type"]
         input_dim_e=dataset_info(dataset_name)["num_edge_type"]
-        
-        fixed_Z = torch.randn(1000,input_dim)
 
         #models
         encoder=Encoder(input_dim_n, input_dim_e, em_node_mlp=[57], em_edge_mlp=[57], node_mlp=[57], edge_mlp=[57], num_fine=5, encoder_out_dim=5*57, dropout=dropout, encoder_act=1, device=device)
         predictor=Predictor(encoder_out_dim=5*57, mlp_pre=[55,55,55,55,55], predictor_act=1, dropout=dropout, device=device)
         surrogate=DeepSurrogate(encoder, predictor)
-        
-        generator=Generator_DeConv(max_nodes=max_nodes, input_dim=82, num_node_type=dataset_info(dataset_name)["num_node_type"], num_edge_type=dataset_info(dataset_name)["num_edge_type"], channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(2,1),(2,3),(1,2),(1,2)], paddings=[(1,0),(1,1),(1,1),(1,2)], output_padding=[(1,0),(1,1),(0,1),(0,0)], act=1, dropout=0.0, dataset=dataset_name, device=device)
 
-        vaeencoder = None
+        generator=Generator_DeConv(max_nodes=max_nodes, input_dim=input_dim, num_node_type=dataset_info(dataset_name)["num_node_type"], num_edge_type=dataset_info(dataset_name)["num_edge_type"], channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(1,1),(1,4),(1,2),(1,2)], paddings=[(0,0),(0,0),(0,1),(0,1)], act=1, dropout=0.0, dataset=dataset_name, device=device)
+        
+        if pretrain_name is None:
+            #do pretrain VAE
+            vaeencoder=VAEEncoder(input_dim_n, input_dim_e, em_node_mlp=[57], em_edge_mlp=[57], node_mlp=[57], edge_mlp=[57], num_fine=5, encoder_out_dim=82, dropout=0., encoder_act=1, device=device)
+        else:
+            vaeencoder = None
         
         discriminator = []
-
         trainVAE = TrainVAE(vaeencoder, generator)
         trainSurr = TrainSurrogate(surrogate)
-        trainGen = TrainGenerator(None, surrogate, discriminator,lam_1 = lam_1,lam_2 = lam_2,lam_3 = lam_3) #lam_1 = 0.019760427,lam_2 = 0.735347235,lam_3 = 0.122988917
+        trainGen = TrainGenerator(None, surrogate, discriminator,lam_1 = lam_1,lam_2 = lam_2,lam_3 = lam_3)
         genCan = GenCandidates(dataset=dataset_name)
         chooseNext = ChooseNext(surrogate, constraint=None, generator=generator, vaeencoder=vaeencoder)
         
-        eval_mol = testGenerativeQuality(filename=store_file_name,target='joint', dataset=dataset_name)
-        
-        
-        dataset = get_data(dataset_name)
-        start_idx = random.choice(range(len(dataset)-init_num))
-        dataset.cut(start_idx,start_idx+init_num)
-        
-        
+        eval_mol = testGenerativeQuality(filename=store_file_name,target=target, dataset=dataset_name)
+
+        if pretrain_name is None:
+            #do pretrain
+            dataset = get_data(dataset_name)
+            index_list = random.sample(range(len(dataset)),init_num)
+            dataset.cutfromlist(index_list)
+
+            #train VAE
+            trainVAE.train(dataset, batch_size=100, num_epochs=pretrain_num_epochs, learning_rate=1e-3, weight_decay=1e-5,run_one_batch=False)
+
+            generator.save_model("models/orig_rand%s"%init_num)
+            vaeencoder.save_model("models/orig_vae_rand%s"%init_num)
+
+            exit(0)
+
+        else:
+            #do optimize
+            if exist_init_nets is None:
+                #the init networks are not exist, so we need to choose [init_num] nets from dataset randomly
+                dataset = get_data(dataset_name)
+                
+                index_list = random.sample(range(len(dataset)),init_num)
+                
+                dataset.cutfromlist(index_list)
+            
+            else:
+                #the init networks are exist
+                #make init data from file
+                init_smi = []
+                with open(exist_init_nets,mode='r') as initf:
+                    lines = initf.readlines()
+                    for line in lines:
+                        init_smi.append(line.strip())
+                print("init smiles:",init_smi)
+                
+                data_list = []
+                dataset = get_data(dataset_name)
+                for d in dataset:
+                    mol = to_mol({'x':d.x,'edge_index':d.edge_index,'edge_attr':d.edge_attr},dataset=dataset_name)
+                    if mol is None:
+                        new_mol = ""
+                    else:
+                        new_mol=Chem.MolToSmiles(mol)
+                    if new_mol in init_smi:
+                        data_list.append(d)
+                        print("found init data",len(data_list),"/",len(init_smi),end="\r")
+                        if len(data_list)>=init_num:
+                            break
+                dataset.data_list=data_list
+                dataset.cut(0,init_num)
+
+        #restore the pretrained generation model
+        generator.restore_model(pretrain_name)
+
+        res=[]
         #evaluate the init graphs
         for i in range(len(dataset)):
-            results = eval_mol.test_NASBench201([[dataset[i].x,dataset[i].edge_index,dataset[i].edge_attr]],store_flag=True)
-            dataset[i].y[:] = results[0]["y"]
-            dataset.data_list[i].y[:] = results[0]["y"]
-            #res.append(results[0]["y"])
+            results = eval_mol.test([[dataset[i].x,dataset[i].edge_index,dataset[i].edge_attr]],store_flag=True)
+            dataset[i].y[:,TASK_NO] = results[0]["y"]
+            dataset.data_list[i].y[:,TASK_NO] = results[0]["y"]
+            res.append(results[0]["y"])
 
         genCan.init_observed_data(dataset)
-        
-    
+
+        """
+        res_orig = eval_mol.test_dataset(dataset)
+        res_orig = eval_mol.denormalize(res_orig)
+        res_train = copy.deepcopy(res_orig)
+        print("orig data set is ",np.mean(res_orig)," +- ", np.std(res_orig))
+
+        genCan.init_observed_data(dataset)
+
+        dataset_test = get_data(dataset_name)
+        dataset_test.cut(10000-100,10000+100)
+        #evaluate the init graphs
+        for i in range(len(dataset_test)):
+            results = eval_mol.test([[dataset_test[i].x,dataset_test[i].edge_index,dataset_test[i].edge_attr]],store_flag=False)
+            dataset_test[i].y[:,TASK_NO] = results[0]["y"]
+            dataset_test.data_list[i].y[:,TASK_NO] = results[0]["y"]
+
+        #exit(1)
+        """
+
         generator_orig = copy.deepcopy(generator)
 
+        generator_orig.save_model("models/orig_pretrain")
+
+        #draw_dis(generator,fixed_Z,"orig")
 
         #do optimize
         for iter_idx in range(max_iter):
@@ -2264,32 +2008,36 @@ if __name__ == "__main__":
                     num_epochs_gen_curr = gen_num_epochs0
                 else:
                     num_epochs_gen_curr = gen_num_epochs1
-                
-                trainGen.train_GAN_and_Exp(generator, dataset, batch_size=50, lr_gen=1e-4, lr_disc=0.00005, weight_decay=1e-5, temperature=0.1, temperature_annealing_rate=1., num_epochs_gen=num_epochs_gen_curr, num_epochs_disc=5, use_random=use_random, use_regularize=False, use_exp=True, vaeencoder=vaeencoder, surrogate=surrogate, params=None)
+                #generator=copy.deepcopy(generator_orig)
+                trainGen.train_GAN_and_Exp(generator, dataset, batch_size=50, lr_gen=5e-4, lr_disc=0.00005, weight_decay=1e-5, temperature=0.1, temperature_annealing_rate=1., num_epochs_gen=num_epochs_gen_curr, num_epochs_disc=5, use_random=use_random, use_regularize=True, use_exp=True, vaeencoder=vaeencoder, surrogate=surrogate, params=None)
                 #if iter_idx%40==0:
                 #    draw_dis(generator,fixed_Z,iter_idx)
 
-            candidates_new = genCan.generate_candidates(generator, filter_flag=True, num_gen=1000, use_random=use_random)
-            #candidates_orig = genCan.generate_candidates(generator_orig, filter_flag=True, num_gen=1000, use_random=use_random)
-            candidates_orig = []
+            candidates_new = genCan.generate_candidates(generator, filter_flag=True, num_gen=500, use_random=use_random)
+            candidates_orig = genCan.generate_candidates(generator_orig, filter_flag=True, num_gen=500, use_random=use_random)
             
-            candidates = candidates_new + candidates_orig
+            candidates = genCan.filter(candidates_new + candidates_orig)
             
             print("gen=",len(candidates_new),"orig=",len(candidates_orig),"total=",len(candidates))
             chooseNext.trainGen=trainGen
             chooseNext.dataset=dataset
             chooseNext.y_observed = genCan.observed_data["y"]
             next_g_1, idx_1 = chooseNext.next(candidates,"EI")
+            #next_g_2, idx_2 = chooseNext.next(candidates,"Std")
             strategy_no = 0
 
+            #if idx_1==idx_2:
+                #next_g = next_g_1
+            #else:
+                #next_g = next_g_1 + next_g_2
             next_g = next_g_1
-            evaluation_list = eval_mol.test_NASBench201(next_g)
-
+            evaluation_list = eval_mol.test(next_g)
             genCan.update_observed_data(next_g,evaluation_list)
             for i in range(len(evaluation_list)):
-                if evaluation_list[i]["y"] != -10.:
-                    augment_into(dataset,{'x':next_g[i][0].float(),'edge_index':next_g[i][1].long(),'edge_attr':next_g[i][2].float(),'y':torch.tensor([evaluation_list[i]["y"]]).view(-1).float()}, comments="add one")
-            #print(dataset,eval_mol.denormalize([evaluation_list[i]["y"] for i in range(len(evaluation_list))]))
+                augment_into(dataset,{'x':next_g[i][0].float(),'edge_index':next_g[i][1].long(),'edge_attr':next_g[i][2].float(),'y':torch.tensor([evaluation_list[i]["y"] if j==TASK_NO else 0. for j in range(dataset[0].y.size(1))]).view(1,-1).float()}, comments=evaluation_list[i]["smiles"])
+                #res_train.append(evaluation_list[i]["y"])
+            print(dataset,eval_mol.denormalize([evaluation_list[i]["y"] for i in range(len(evaluation_list))]))
+
             #generator.save_model("models/iter_%s_%s_%s_%s"%(model_name,acq_type,seed,iter_idx+1))
 
 

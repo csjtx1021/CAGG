@@ -33,11 +33,12 @@ from torch_scatter import scatter_add
 from data_utils import get_data, to_mol, dataset_info
 import csv
 import seaborn as sns
-import tools
+import tools_for_multibranch as tools
 
-use_prob_temp = True
-use_regularize = True
+use_prob_temp=True
+use_regularize=True
 num_multi_gen = 1
+
 
 lam_1 = 10.
 lam_2 = 1.
@@ -52,31 +53,30 @@ LARGE_NUMBER = 1e10
 
 TASK_NO = 0
 
+
 import argparse
-parser = argparse.ArgumentParser(description='CAND')
+parser = argparse.ArgumentParser(description='CAGG')
 parser.add_argument('--seed', type=int, default=0, metavar='S',
                     help='random seed (default: 0)')
-parser.add_argument('--dataset', help='the dataset needs to be handled ["qm9"] default:"qm9"', default="qm9")
-parser.add_argument('--max_nodes', type=int, default=9, metavar='S',
-                    help='maximum number of nodes while generating networks (default: 9)')
-parser.add_argument('--max_iter', type=int, default=500, metavar='S',
-                    help='maximum number of iterations (default: 500)')
-parser.add_argument('--init_num', type=int, default=50, metavar='S',
-                    help='number of initialized networks (default: 50)')
+parser.add_argument('--dataset', help='the dataset needs to be handled ["nn"] default:"nn"', default="nn")
+parser.add_argument('--max_nodes', type=int, default=20, metavar='S',
+                    help='maximum number of nodes while generating networks (default: 20)')
+parser.add_argument('--max_iter', type=int, default=60, metavar='S',
+                    help='maximum number of iterations (default: 60)')
+parser.add_argument('--init_num', type=int, default=10, metavar='S',
+                    help='number of initialized networks (default: 10)')
 parser.add_argument('--dropout', type=float, default=0.1, metavar='S',
                     help='dropout (default: 0.1)')
 parser.add_argument('--acq_type', help='the type of acquisition function ["EI"] default:"EI"', default="EI")
-parser.add_argument('--property_name', help='the property name that we want to optimize ["5*QED-SA","logP-SA"] default="5*QED-SA"', default="5*QED-SA")
 parser.add_argument('--store_file_name', help='the output file name, default:"results/observations.csv"', default="results/observations.csv")
 parser.add_argument('--pretrain_name', help='the pretrained model name', default=None) #"models/orig_rand%s"%init_num
-parser.add_argument('--exist_init_nets', help='file name of the exist initialized networks', default=None) #"data/QM9_init/init_smiles_r%s.txt"%seed"
 parser.add_argument('--surr_num_epochs', type=int, default=600, metavar='S',
                     help='the number of epochs in training the surrogate model (default: 600)')
-parser.add_argument('--pretrain_num_epochs', type=int, default=500, metavar='S',
-                    help='the number of epochs in pre-training the generation model in a VAE fashion (default: 500)')
+parser.add_argument('--pretrain_num_epochs', type=int, default=70, metavar='S',
+                    help='the number of epochs in pre-training the generation model in a VAE fashion (default: 70)')
 parser.add_argument('--retrain_step', type=int, default=20, metavar='S',
                     help='every x steps to retrain the surrogate and generation models (default: 20)')
-parser.add_argument('--gen_num_epochs0', type=int, default=50, metavar='S',
+parser.add_argument('--gen_num_epochs0', type=int, default=100, metavar='S',
                     help='the number of epochs in training the generation model at the first time (default: 50)')
 parser.add_argument('--gen_num_epochs1', type=int, default=10, metavar='S',
                     help='the number of epochs in retraining the generation model after the first time (default: 10)')
@@ -107,25 +107,16 @@ dropout = args.dropout
 use_random = True
 acq_type = args.acq_type
 use_hard = False
-property_name = args.property_name
-model_name = "ours-%s"%property_name #"noAug" "ours" "ours-wotrain" "ours-soft"
+model_name = "ours-%s"%(dataset_name) #"noAug" "ours" "ours-wotrain" "ours-soft"
 store_file_name = args.store_file_name
 input_dim = 82
 pretrain_name = args.pretrain_name
-exist_init_nets = args.exist_init_nets
 surr_num_epochs = args.surr_num_epochs
 pretrain_num_epochs = args.pretrain_num_epochs
 retrain_step = args.retrain_step
 gen_num_epochs0 = args.gen_num_epochs0
 gen_num_epochs1 = args.gen_num_epochs1
 
-if property_name == '5*QED-SA':
-    target = 'joint'
-elif property_name == 'logP-SA':
-    target = 'logppunishedbysa'
-else:
-    print("cannot know the property name [%s], please choose from {\"5*QED-SA\",\"logP-SA\"}"%property_name)
-    exit(1)
 
 #----------------------------
 #Encoder
@@ -427,7 +418,7 @@ class DeepSurrogate(nn.Module):
 #Generator_DeConv
 #------------------------------------------------------------
 class Generator_DeConv(nn.Module):
-    def __init__(self, max_nodes=30, input_dim=32, num_node_type=5, num_edge_type=3, channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(1,1),(1,4),(1,2),(1,2)], paddings=[(0,0),(0,0),(0,1),(0,1)], act=1, dropout=0.0, dataset="qm9", device=None):
+    def __init__(self, max_nodes=30, input_dim=32, num_node_type=5, num_edge_type=3, channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(1,1),(1,4),(1,2),(1,2)], paddings=[(0,0),(0,0),(0,1),(0,1)], output_padding=[(0,0),(0,0),(0,0),(0,0)],act=1, dropout=0.0, dataset="qm9", device=None):
         super(Generator_DeConv, self).__init__()
         
         self.dataset=dataset
@@ -440,6 +431,7 @@ class Generator_DeConv(nn.Module):
         self.kernels=kernels
         self.strides=strides
         self.paddings=paddings
+        self.output_padding=output_padding
         self.dropout=dropout
         self.use_prob_temp=use_prob_temp
         self.num_multi_gen=num_multi_gen
@@ -457,9 +449,9 @@ class Generator_DeConv(nn.Module):
         self.gen_model = torch.nn.Sequential()
         for i in range(len(self.channels)):
             if i==0:
-                self.gen_model.add_module("ConvTranspose2d_%s"%(i+1),nn.ConvTranspose2d(self.input_dim, self.channels[i], self.kernels[i], self.strides[i], self.paddings[i], bias=False))
+                self.gen_model.add_module("ConvTranspose2d_%s"%(i+1),nn.ConvTranspose2d(self.input_dim, self.channels[i], self.kernels[i], self.strides[i], self.paddings[i], self.output_padding[i],bias=False))
             else:
-                self.gen_model.add_module("ConvTranspose2d_%s"%(i+1),nn.ConvTranspose2d(self.channels[i-1], self.channels[i], self.kernels[i], self.strides[i], self.paddings[i], bias=False))            
+                self.gen_model.add_module("ConvTranspose2d_%s"%(i+1),nn.ConvTranspose2d(self.channels[i-1], self.channels[i], self.kernels[i], self.strides[i], self.paddings[i], self.output_padding[i],bias=False))            
             if i<len(self.channels)-1:
                 self.gen_model.add_module("BatchNorm2d_%s"%(i+1),nn.BatchNorm2d(self.channels[i]))
                 self.gen_model.add_module("act_%s"%(i+1),self.act())
@@ -484,16 +476,28 @@ class Generator_DeConv(nn.Module):
         n = self.max_nodes
         
         assert n == self.max_nodes
+        #print(n,self.max_nodes)
         #assert self.input_dim == Z.size(2)
         
+        #print("self.gen_model(Z.view(b,-1,1,1)).size()",self.gen_model(Z.view(b,-1,1,1)).size(),Z.view(b,-1,1,1).size())
         out = self.gen_model(Z.view(b,-1,1,1)).view(b,n,-1) #[b,1,n,(# node type + 1) + n*(# edge type + 1)]
         out_nodes = out[:,:,0:self.num_node_type+1].view(b,n,-1) #[b,n,d]->[b, n, # node type + 1]
-            
+        
+        #The following case is deterministic: the first node is input and the last node is ouput
+        #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
+        # and 0,1 for input and ouput
+        out_nodes_mask = torch.zeros_like(out_nodes)
+        out_nodes_mask[:,:,1] = -LARGE_NUMBER
+        out_nodes_mask[:,0,1] = LARGE_NUMBER
+        out_nodes_mask[:,:,2] = -LARGE_NUMBER
+        out_nodes_mask[:,n-1,2] = LARGE_NUMBER
+
         #reparameterization
-        X = F.softmax(out_nodes, dim=-1) #[b, n, # node type+1]
+        X = F.softmax(out_nodes + out_nodes_mask, dim=-1) #[b, n, # node type+1]
 
         all_edges = torch.triu_indices(n, n, 1).long() #[2,n*(n-1)/2]
-            
+        
+        #print("out.size()=",out.size())
         out_edge = out[:,:,self.num_node_type+1:].view(b,n,n,self.num_edge_type+1) #[b, n,n, # edge type + 1]
         idx_triu = torch.triu(torch.ones(b,n,n),diagonal=1) 
         out_edge = out_edge[idx_triu==1].view(b,-1,self.num_edge_type+1) #[b,n*(n-1)/2, # edge type + 1]
@@ -509,11 +513,9 @@ class Generator_DeConv(nn.Module):
             batch = batch + [i]*n
             edge_index.append(edge_index_one+i*n)
 
-        edge_index = torch.cat(edge_index,dim=-1).long().to(self.device)
-        edge_index = edge_index[[0,1,1,0]].view(2,-1)
+        edge_index = torch.cat(edge_index,dim=-1).long().to(self.device).view(2,-1)
         batch = torch.tensor(batch).long().to(self.device)
         edge_attr = visited_edges
-        edge_attr = torch.cat([edge_attr,edge_attr],dim=1) #[b, 2*alledges,# edge type+1]
         #print("nodes=",X[:,:,1:])
         #print("active_node=",torch.sum(1.0 - X[:,:,0].view(-1)))
         #print("active_edge=",torch.sum(1.0 - edge_attr[:,:,0].view(-1)))
@@ -532,7 +534,8 @@ class Generator_DeConv(nn.Module):
                     index_one = np.random.choice(np.arange(self.num_edge_type+1),p=visited_edges[b_idx,edge_idx,:].detach().cpu().numpy())
                     visited_edges_temp[b_idx,edge_idx,index_one] = 1.
             edge_attr_temp = visited_edges_temp
-            edge_attr_temp = torch.cat([edge_attr_temp,edge_attr_temp],dim=1) #[b, 2*alledges,# edge type+1]
+            #edge_attr_temp = torch.cat([edge_attr_temp,edge_attr_temp],dim=1) #[b, 2*alledges,# edge type+1]
+            
             #compute the log probability of generation
             log_prob_temp = torch.sum(torch.sum(torch.log(X+SMALL_NUMBER) * X_temp,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(visited_edges+SMALL_NUMBER) * visited_edges_temp,dim=-1),dim=-1) #[b,]
 
@@ -565,8 +568,18 @@ class Generator_DeConv(nn.Module):
             X_list = []
             visited_edges_list = []
             log_prob_list = []
+
+            #The following case is deterministic: the first node is input and the last node is ouput
+            #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
+            # and 0,1 for input and ouput
+            out_nodes_mask = torch.zeros_like(out_nodes)
+            out_nodes_mask[:,:,1] = -LARGE_NUMBER
+            out_nodes_mask[:,0,1] = LARGE_NUMBER
+            out_nodes_mask[:,:,2] = -LARGE_NUMBER
+            out_nodes_mask[:,n-1,2] = LARGE_NUMBER
+
             #X = F.gumbel_softmax(out_nodes, tau=temperature, hard=True, dim=-1).detach() #[b, n, # node type+1]
-            X_probs = F.softmax(out_nodes,dim=-1).detach() #[b, n, # node type+1]
+            X_probs = F.softmax(out_nodes + out_nodes_mask,dim=-1).detach() #[b, n, # node type+1]
             #visited_edges = F.gumbel_softmax(out_edge, tau=temperature, hard=True, dim=-1).detach() #[b, # all edge, # edge type+1]
             out_edge_probs = F.softmax(out_edge,dim=-1).detach() #[b, # all edge, # edge type+1]
 
@@ -609,6 +622,17 @@ class Generator_DeConv(nn.Module):
             log_prob = torch.cat(log_prob) #[b,]   
 
         else:
+            X_list,visited_edges_list = [], []
+            #The following case is deterministic: the first node is input and the last node is ouput
+            #Thus, we mask two dim i.e., 1,2, in the hidden nodes to 0, and mask these two dim to 1,0 
+            # and 0,1 for input and ouput
+            out_nodes_mask = torch.zeros_like(out_nodes)
+            out_nodes_mask[:,:,1] = -LARGE_NUMBER
+            out_nodes_mask[:,0,1] = LARGE_NUMBER
+            out_nodes_mask[:,:,2] = -LARGE_NUMBER
+            out_nodes_mask[:,n-1,2] = LARGE_NUMBER
+
+            out_nodes = out_nodes + out_nodes_mask
             index_x = out_nodes.max(-1, keepdim=True)[1]
             X = torch.zeros_like(out_nodes).scatter_(-1, index_x, 1.0)
 
@@ -619,10 +643,10 @@ class Generator_DeConv(nn.Module):
             log_prob = torch.sum(torch.sum(torch.log(torch.softmax(out_nodes,dim=-1)+SMALL_NUMBER) * X,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(torch.softmax(out_edge,dim=-1)+SMALL_NUMBER) * visited_edges,dim=-1),dim=-1) #[b,]
         
     
-        edge_index = all_edges.long().to(self.device)
-        edge_index = edge_index[[0,1,1,0]].view(2,-1)
+        edge_index = all_edges.long().to(self.device).view(2,-1)
+        #edge_index = edge_index[[0,1,1,0]].view(2,-1)
         edge_attr = visited_edges.to(self.device)
-        edge_attr = torch.cat([edge_attr,edge_attr],dim=1) #[b, 2*alledges,# edge type+1]
+        #edge_attr = torch.cat([edge_attr,edge_attr],dim=1) #[b, 2*alledges,# edge type+1]
         
         
         graphs = []
@@ -708,11 +732,11 @@ class TrainVAE():
                 #print(z.size(),encoder_out_mu.size(),encoder_out_logvar.size())
                 [nodes_labels, edge_index, edge_attr, active_nodes, active_edges, batch], _, _ = self.generator.forward_prob_temp(z, temperature=temperature, use_random=use_random,use_hard=False)
                 #print(nodes_labels.size(),active_nodes.size())
-                fake_x = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1).view(batch_size,self.generator.max_nodes,-1) #[b,n,1+d]
-                fake_attr = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1).view(batch_size,self.generator.max_nodes*(self.generator.max_nodes-1),-1) #[b,n*(n-1),1+d]
+                fake_x = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1).view(batch_size,-1,self.generator.num_node_type+1) #[b,n,1+d]
+                fake_attr = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1).view(batch_size,-1,self.generator.num_edge_type+1) #[b,n*(n-1),1+d]
                 
-                real_x = tools.to_dense_batch(batch_data.x, max_num_nodes=self.generator.max_nodes, batch=batch_data.batch, fill_value=0).view(batch_size,self.generator.max_nodes,-1) #[b,n,1+d]
-                real_attr = tools.to_dense_adj(batch_data.edge_index, max_num_nodes=self.generator.max_nodes, batch=batch_data.batch, edge_attr=batch_data.edge_attr).view(batch_size,self.generator.max_nodes*(self.generator.max_nodes-1),-1) #[b,n*(n-1),1+d]
+                real_x = tools.to_dense_batch(batch_data.x, max_num_nodes=self.generator.max_nodes, batch=batch_data.batch, fill_value=0).view(batch_size,-1,self.generator.num_node_type+1) #[b,n,1+d]
+                real_attr = tools.to_dense_adj(batch_data.edge_index, max_num_nodes=self.generator.max_nodes, batch=batch_data.batch, edge_attr=batch_data.edge_attr).view(batch_size,-1,self.generator.num_edge_type+1) #[b,n*(n-1),1+d]
 
                 loss_rec = torch.sum(torch.sum(torch.log(fake_x+SMALL_NUMBER) * real_x,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(fake_attr+SMALL_NUMBER) * real_attr,dim=-1),dim=-1)
                 #loss_rec = torch.prod(torch.prod(torch.pow(fake_x,real_x),dim=-1),dim=-1) * torch.prod(torch.prod(torch.pow(fake_attr,real_attr),dim=-1),dim=-1) #[b,]
@@ -732,32 +756,36 @@ class TrainVAE():
                 A_list = [torch.eye(batch_size*self.generator.max_nodes), A]
                 #print("A[row, col]=",A[row, col],A[row, col].sum())
                 for _ in range(2,self.generator.max_nodes):
-                    A_mm = torch.mm(A_list[-1],A.T)
+                    A_mm = torch.mm(A_list[-1],A)
                     #print("A_mm[row, col]=",A_mm[row, col],A_mm[row, col].sum())
                     A_temp = torch.zeros_like(A_mm)
                     A_temp[row, col] = 1. / (1. + (a * ( A_mm[row, col] - 0.5)).exp())
                     #print("A_temp=",A_temp)
                     #print("A_temp[row, col]=",A_temp[row, col],A_temp[row, col].sum())
                     A_list.append(A_temp)
-                
-                C = 1. / (1. + (a * (sum(A_list)[row, col] - 0.5)).exp())
+                                
+                sum_A = sum(A_list)
+                C = 1. / (1. + (a * (sum_A[row, col] - 0.5)).exp())
                 
                 #print("C=",C,C.sum())
-                
-                loss_reg_connect = active_nodes[row] * active_nodes[col] * (1. - C) + (1. - active_nodes[row] * active_nodes[col]) * C
-                loss_reg_connect = loss_reg_connect[loss_reg_connect>SMALL_NUMBER].sum()
-                
-                #the validity constraint
-                U = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1) * torch.tensor([0.]+list(dataset_info(self.generator.dataset)['maximum_valence'].values())).float().view(1,-1).to(self.generator.device) #[b * n, # node type +1]
-                U = torch.sum(U,dim=-1) #[b*n,]
-                
-                V = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1) * torch.tensor([0.]+list(dataset_info(self.generator.dataset)['bond'].values())).float().view(1,-1).to(self.generator.device)
-                V = torch.sum(V,dim=-1) #[b*m,]
-                
-                V = scatter_add(V, edge_index[1], dim=0, out=torch.zeros(batch_size*self.generator.max_nodes,)) #[b*n,]
-                
-                C_val = V-U
-                loss_reg_valid = C_val[C_val>SMALL_NUMBER].sum()
+
+                x_idx = torch.arange(batch_size*self.generator.max_nodes).long()
+                input_idx = (torch.arange(0,batch_size*self.generator.max_nodes,self.generator.max_nodes).float().view(batch_size,1)*torch.ones(batch_size,self.generator.max_nodes)).view(-1).long()
+                output_idx = (torch.arange(self.generator.max_nodes-1,batch_size*self.generator.max_nodes,self.generator.max_nodes).float().view(batch_size,1)*torch.ones(batch_size,self.generator.max_nodes)).view(-1).long()
+
+                C_input = 1. / (1. + (a * (sum_A[input_idx, x_idx] - 0.5)).exp())
+                C_output = 1. / (1. + (a * (sum_A[x_idx, output_idx] - 0.5)).exp())
+                #print(active_nodes.view(-1))
+                #print(sum(C_input),sum(C_output))
+
+                loss_reg_connect_indeg = active_nodes.view(-1) * (1. - C_input) + (1. - active_nodes.view(-1)) * scatter_add(C, col, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes))
+                loss_reg_connect_outdeg = active_nodes.view(-1) * (1. - C_output) + (1. - active_nodes.view(-1)) * scatter_add(C, row, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes))
+                #print("scatter_add(C, col, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes)=",scatter_add(C, col, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes)))
+                #print("scatter_add(C, row, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes)=",scatter_add(C, row, dim=0, out=torch.zeros(batch_size*self.generator.max_nodes)))
+
+                loss_reg_connect = loss_reg_connect_indeg[loss_reg_connect_indeg>SMALL_NUMBER].sum()
+
+                loss_reg_valid = loss_reg_connect_outdeg[loss_reg_connect_outdeg>SMALL_NUMBER].sum()
                 
                 loss = loss_elbo + self.lam_2 * loss_reg_valid + self.lam_3 * loss_reg_connect
                 #loss = loss_elbo + loss_reg_valid + loss_reg_connect
@@ -776,11 +804,11 @@ class TrainVAE():
             print("training vae : epoch %s, total loss: %.5f, elbo: %.5f [kl: %.5f, recon: %.5f], connect: %.5f, valid: %.5f | time cost: %.2f" % (epoch+1,loss.item(),loss_elbo.item(),loss_kl.mean().item(),-loss_rec.mean().item(),loss_reg_connect.item(),loss_reg_valid.item(), time.time()-train_time),end="\n")
 
 
-        pl.plot(loss_store["total_loss"],'k')
-        pl.plot(loss_store["elbo_loss"],'r')
-        pl.legend(["total_loss","elbo_loss"])
-        #pl.savefig("vae_log_loss.png")
-        pl.close()
+            pl.plot(loss_store["total_loss"],'k')
+            pl.plot(loss_store["elbo_loss"],'r')
+            pl.legend(["total_loss","elbo_loss"])
+            #pl.savefig("vae_log_loss.png")
+            pl.close()
 
 
 
@@ -828,7 +856,7 @@ class TrainGenerator():
         data_set_copy = real_data
         batch_size_vae = min(int(len(data_set_copy)/2),batch_size_vae) #choose best 1/2 to train 
         #sort data
-        data_set_copy.data_list.sort(key=lambda d:d.y[:,TASK_NO],reverse=True)
+        data_set_copy.data_list.sort(key=lambda d:d.y[:],reverse=True)
         #data_set_copy.cut(0,min(len(data_set_copy)/2,batch_size_vae)) #choose best 1/2 to train 
 
         total_time_start = time.time()
@@ -894,11 +922,11 @@ class TrainGenerator():
                 z = vaeencoder.reparameterize(encoder_out_mu, encoder_out_logvar)
                 #print(z.size(),encoder_out_mu.size(),encoder_out_logvar.size())
                 [nodes_labels, edge_index, edge_attr, active_nodes, active_edges, batch], _, _ = generator.forward_prob_temp(z, temperature=temperature, use_random=use_random, use_hard=False)
-                fake_x = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1).view(batch_size_vae,generator.max_nodes,-1) #[b,n,1+d]
-                fake_attr = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1).view(batch_size_vae,generator.max_nodes*(generator.max_nodes-1),-1) #[b,n*(n-1),1+d]
+                fake_x = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1).view(batch_size_vae,-1,generator.num_node_type+1) #[b,n,1+d]
+                fake_attr = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1).view(batch_size_vae,-1,generator.num_edge_type+1) #[b,n*(n-1),1+d]
                 
-                real_x = tools.to_dense_batch(batch_data.x, max_num_nodes=generator.max_nodes, batch=batch_data.batch, fill_value=0).view(batch_size_vae,generator.max_nodes,-1) #[b,n,1+d]
-                real_attr = tools.to_dense_adj(batch_data.edge_index, max_num_nodes=generator.max_nodes, batch=batch_data.batch, edge_attr=batch_data.edge_attr).view(batch_size_vae,generator.max_nodes*(generator.max_nodes-1),-1) #[b,n*(n-1),1+d]
+                real_x = tools.to_dense_batch(batch_data.x, max_num_nodes=generator.max_nodes, batch=batch_data.batch, fill_value=0).view(batch_size_vae,-1,generator.num_node_type+1) #[b,n,1+d]
+                real_attr = tools.to_dense_adj(batch_data.edge_index, max_num_nodes=generator.max_nodes, batch=batch_data.batch, edge_attr=batch_data.edge_attr).view(batch_size_vae,-1,generator.num_edge_type+1) #[b,n*(n-1),1+d]
                 
                 loss_rec = torch.sum(torch.sum(torch.log(fake_x+SMALL_NUMBER) * real_x,dim=-1),dim=-1) + torch.sum(torch.sum(torch.log(fake_attr+SMALL_NUMBER) * real_attr,dim=-1),dim=-1)
                 #loss_rec = torch.prod(torch.prod(torch.pow(fake_x,real_x),dim=-1),dim=-1) * torch.prod(torch.prod(torch.pow(fake_attr,real_attr),dim=-1),dim=-1) #[b,]
@@ -940,34 +968,31 @@ class TrainGenerator():
                 A_list = [torch.eye(batch_size*generator.max_nodes), A]
                 #print("A[row, col]=",A[row, col],A[row, col].sum())
                 for _ in range(2,generator.max_nodes):
-                    A_mm = torch.mm(A_list[-1],A.T)
+                    A_mm = torch.mm(A_list[-1],A)
                     #print("A_mm[row, col]=",A_mm[row, col],A_mm[row, col].sum())
                     A_temp = torch.zeros_like(A_mm)
                     A_temp[row, col] = 1. / (1. + (a * ( A_mm[row, col] - 0.5)).exp())
                     #print("A_temp=",A_temp)
                     #print("A_temp[row, col]=",A_temp[row, col],A_temp[row, col].sum())
                     A_list.append(A_temp)
+                sum_A = sum(A_list)
+                C = 1. / (1. + (a * (sum_A[row, col] - 0.5)).exp())
                 
-                C = 1. / (1. + (a * (sum(A_list)[row, col] - 0.5)).exp())
-                
-                print("C=",C,C.sum())
-                
-                loss_reg_connect = active_nodes[row] * active_nodes[col] * (1. - C) + (1. - active_nodes[row] * active_nodes[col]) * C
-                loss_reg_connect = loss_reg_connect[loss_reg_connect>SMALL_NUMBER].sum()
-                
-                #the validity constraint
-                U = torch.cat([1.0-active_nodes.view(-1,1),nodes_labels],dim=-1) * torch.tensor([0.]+list(dataset_info(generator.dataset)['maximum_valence'].values())).float().view(1,-1).to(generator.device) #[b * n, # node type +1]
-                U = torch.sum(U,dim=-1) #[b*n,]
-                
-                V = torch.cat([1.0-active_edges.view(-1,1),edge_attr],dim=-1) * torch.tensor([0.]+list(dataset_info(generator.dataset)['bond'].values())).float().view(1,-1).to(generator.device)
-                V = torch.sum(V,dim=-1) #[b*m,]
-                
-                V = scatter_add(V, edge_index[1], dim=0, out=torch.zeros(batch_size*generator.max_nodes,)) #[b*n,]
-                
-                C_val = V-U
-                loss_reg_valid = C_val[C_val>SMALL_NUMBER].sum()
-                
-            
+                #print("C=",C,C.sum())
+
+                x_idx = torch.arange(batch_size*generator.max_nodes).long()
+                input_idx = (torch.arange(0,batch_size*generator.max_nodes,generator.max_nodes).float().view(batch_size,1)*torch.ones(batch_size,generator.max_nodes)).view(-1).long()
+                output_idx = (torch.arange(generator.max_nodes-1,batch_size*generator.max_nodes,generator.max_nodes).float().view(batch_size,1)*torch.ones(batch_size,generator.max_nodes)).view(-1).long()
+
+                C_input = 1. / (1. + (a * (sum_A[input_idx, x_idx] - 0.5)).exp())
+                C_output = 1. / (1. + (a * (sum_A[x_idx, output_idx] - 0.5)).exp())
+
+                loss_reg_connect_indeg = active_nodes.view(-1) * (1. - C_input) + (1. - active_nodes.view(-1)) * scatter_add(C, col, dim=0, out=torch.zeros(batch_size*generator.max_nodes))
+                loss_reg_connect_outdeg = active_nodes.view(-1) * (1. - C_output) + (1. - active_nodes.view(-1)) * scatter_add(C, row, dim=0, out=torch.zeros(batch_size*generator.max_nodes))
+
+                loss_reg_connect = loss_reg_connect_indeg[loss_reg_connect_indeg>SMALL_NUMBER].sum()
+                loss_reg_valid = loss_reg_connect_outdeg[loss_reg_connect_outdeg>SMALL_NUMBER].sum()
+
             total_loss = self.lam_1 * loss_exp + self.lam_2 * loss_reg_valid + self.lam_3 * loss_reg_connect + loss_elbo
             #total_loss =  self.lam_2 * loss_reg_valid + self.lam_3 * loss_reg_connect
             
@@ -1018,11 +1043,11 @@ class TrainGenerator():
         
         #pl.plot(loss_store["loss_d"],'b')
         #pl.plot(loss_store["loss_g"],'g')
-        #pl.plot(loss_store["loss_exp"],'r')
-        #pl.plot(loss_store["loss_reg_valid"],'c')
-        #pl.plot(loss_store["loss_reg_connect"],'y')
-        #pl.plot(loss_store["total_loss"],'k')
-        #pl.legend(["loss_exp",'loss_reg_valid',"loss_reg_connect","total_loss"])
+        pl.plot(loss_store["loss_exp"],'r')
+        pl.plot(loss_store["loss_reg_valid"],'c')
+        pl.plot(loss_store["loss_reg_connect"],'y')
+        pl.plot(loss_store["total_loss"],'k')
+        pl.legend(["loss_exp",'loss_reg_valid',"loss_reg_connect","total_loss"])
         #pl.show()
         #pl.savefig("gen_score_log.png")
         #pl.close()
@@ -1106,7 +1131,7 @@ class TrainSurrogate():
                 
                 labels_pre = self.surrogate.predictor(encoder_out_mu)
             
-                loss_pre = self.mseloss_fn(batch.y[:,TASK_NO].view(-1),labels_pre.view(-1))
+                loss_pre = self.mseloss_fn(batch.y[:].view(-1),labels_pre.view(-1))
                 
                 loss_pre.backward()
                 optimizer.step()
@@ -1118,7 +1143,6 @@ class TrainSurrogate():
                 epoch_time = time.time() - total_time_start
                 if (epoch+1)%50 == 0 or num_epochs < 50 or step % 50 == 0:
                     print("training surrogate : epoch %s batch %s (has %s graphs), loss: %.5f| time cost: %.2f" % (epoch+1, step, batch.num_graphs, loss/processed_graphs, epoch_time),end="\r")
-                    #print("left-real,right-pre",torch.cat([batch.y[:,TASK_NO].view(-1,1),labels_pre.view(-1,1)],-1))
 
     
             loss_store.append(loss/processed_graphs)
@@ -1140,11 +1164,11 @@ class TrainSurrogate():
             data_loader = DataLoader(valid, batch_size=len(valid), shuffle=False)
             for batch in data_loader:
                 
-                pre_mu, pre_sigma2, rmse_mc, test_ll = self.surrogate.predict(batch.x, batch.edge_index, batch.edge_attr, batch.batch, 10, uncertainty=True, tau=tau, y_test=batch.y[:,TASK_NO].view(-1))
+                pre_mu, pre_sigma2, rmse_mc, test_ll = self.surrogate.predict(batch.x, batch.edge_index, batch.edge_attr, batch.batch, 10, uncertainty=True, tau=tau, y_test=batch.y[:].view(-1))
 
-                pre_mu_wo, _, rmse, _ = self.surrogate.predict(batch.x, batch.edge_index, batch.edge_attr, batch.batch, None, uncertainty=False, tau=None, y_test=batch.y[:,TASK_NO].view(-1))
+                pre_mu_wo, _, rmse, _ = self.surrogate.predict(batch.x, batch.edge_index, batch.edge_attr, batch.batch, None, uncertainty=False, tau=None, y_test=batch.y[:].view(-1))
         
-                print("real=",batch.y[:,TASK_NO].view(-1))
+                print("real=",batch.y[:].view(-1))
                 print("pre_mu_wo=",pre_mu_wo.view(-1))
                 print("pre_mu=",pre_mu.view(-1))
                 print("pre_sigma2=",pre_sigma2)
@@ -1152,13 +1176,13 @@ class TrainSurrogate():
                 print("test loss=",rmse_mc)
         
         
-            pl.scatter(torch.linspace(1,len(valid),len(valid)).numpy(),batch.y[:,TASK_NO].view(-1).numpy(),c='k',alpha=0.5)
+            pl.scatter(torch.linspace(1,len(valid),len(valid)).numpy(),batch.y[:].view(-1).numpy(),c='k',alpha=0.5)
             pl.scatter(torch.linspace(1,len(valid),len(valid)).numpy(),pre_mu_wo.view(-1).detach().numpy(),c='b',alpha=0.5)
             pl.errorbar(torch.linspace(1,len(valid),len(valid)).numpy(),pre_mu.detach().numpy(),yerr=torch.sqrt(pre_sigma2.detach()).numpy(),c='r',alpha=0.5,ecolor='g',capsize=3)
             pl.savefig("eval_surr_%s.png"%name)
             pl.close()
     
-            return self.mseloss_fn(batch.y[:,TASK_NO].view(-1),pre_mu.view(-1)).item()
+            return self.mseloss_fn(batch.y[:].view(-1),pre_mu.view(-1)).item()
 
 
 #==============================================================================
@@ -1476,12 +1500,12 @@ class GenCandidates():
             #print("in=",[x, edge_index, edge_attr, active_nodes, active_edges])
             
             x_sparse = x[active_nodes>0].view(-1,generator.num_node_type)
-            
+            #print(x[-1,:],active_nodes)
             # print(edge_index.size(1),edge_attr.size(0))
             
             edge_index_sparse_old = edge_index[:,active_edges>0]
-            edge_attr_sparse_old = edge_attr[active_edges>0]
-            
+            edge_attr_sparse_old = edge_attr[active_edges>0]        
+
             #print("edge_index_sparse_old=",edge_index_sparse_old)
             
             #node hash
@@ -1497,13 +1521,15 @@ class GenCandidates():
                     edge_attr_sparse_filtered.append(edge_attr_sparse_old[idx].view(1,-1))
             # print(len(edge_index_sparse_filtered),len(edge_attr_sparse_filtered))
             edge_index_sparse_filtered = torch.tensor(edge_index_sparse_filtered).t().long()
-            
+            print("edge_index_sparse_filtered=",edge_index_sparse_filtered)
+
             nodes_idx_filtered=[]
             if len(edge_index_sparse_filtered)>0:
                 #remove the ghost nodes
                 for idx in nodes_idx:
-                    if idx in edge_index_sparse_filtered[0]:
+                    if idx in edge_index_sparse_filtered[0] or idx in edge_index_sparse_filtered[1]:
                         nodes_idx_filtered.append(idx)
+                print(nodes_idx_filtered)
                 x_sparse = x[nodes_idx_filtered,:]
             
             
@@ -1523,9 +1549,15 @@ class GenCandidates():
             #print("edge_index_sparse=",edge_index_sparse)
             #print(edge_attr_sparse.size(0),edge_index_sparse.size(1))
             #assert edge_attr_sparse.size(0)==edge_index_sparse.size(1)
+                        
+            n=x_sparse.size(0)
+            MAX_NODES=x.size(0)
+            if n < MAX_NODES:
+                #padding zeros into x to ensure the first node is input and the 20th one is output
+                x_sparse=torch.cat([x_sparse[0:n-1,:],torch.zeros(MAX_NODES-n,x_sparse.size(1)),x_sparse[n-1,:].view(1,-1)],dim=0)
+                edge_index_sparse[edge_index_sparse==n-1]=MAX_NODES-1
             
             graphs_sparse.append([x_sparse,edge_index_sparse.long(),edge_attr_sparse,log_prob])
-
             print("%s/%s"%(count,Z.size(0)),end='\r')
     
             #print("graph=",[x_sparse,edge_index_sparse,edge_attr_sparse],edge_index_sparse_old,nodes_idx,active_edges)
@@ -1534,26 +1566,29 @@ class GenCandidates():
         generator.train()
         
         if filter_flag:
-            return self.filter(graphs_sparse,key=key)
+            return self.is_valid(graphs_sparse)
         else:
             return graphs_sparse
     
     def init_observed_data(self, dataset):
         #init mols with observed_graphs
         for d in dataset:
+            """
             mol = to_mol({'x':d.x,'edge_index':d.edge_index,'edge_attr':d.edge_attr},dataset=self.dataset)
             if mol is None:
                 new_mol = ""
             else:
                 new_mol=Chem.MolToSmiles(mol)
             self.observed_data["mol"].append(new_mol)
-            self.observed_data["y"].append(d.y[0,TASK_NO])
+            """
+            self.observed_data["y"].append(d.y[0])
 
     def update_observed_data(self,new_graphs,ys):
         #init mols with observed_graphs
         count=-1
         for g in new_graphs:
             count+=1
+            """
             mol = to_mol({'x':g[0],'edge_index':g[1],'edge_attr':g[2]},dataset=self.dataset)
             #mol = to_mol({'x':d.x,'edge_index':d.edge_index,'edge_attr':d.edge_attr})
             if mol is None:
@@ -1561,8 +1596,60 @@ class GenCandidates():
             else:
                 new_mol=Chem.MolToSmiles(mol)
             self.observed_data["mol"].append(new_mol)
+            """
             self.observed_data["y"].append(ys[count]["y"])
     
+    def is_valid(self,graphs):
+        filtered_graphs = []
+        for g in graphs:
+            #print("haha",g)
+            x_sparse,edge_index_sparse,edge_attr_sparse,_ = g
+
+            if x_sparse.size(0) == 0:
+                print("non-valid due to [x_sparse.size(0) == 0]")
+                continue
+            #the first is input and last is output and #only one input and only one output
+            if x_sparse[0][0] == 1 and x_sparse[x_sparse.size(0)-1][1] == 1 and sum(x_sparse[:,0])==1 and sum(x_sparse[:,1])==1:
+                valid_nodes_from_edges = list(set(list(edge_index_sparse[0].numpy())+list(edge_index_sparse[1].numpy())))      
+                print("nodes=",valid_nodes_from_edges)
+                DG = nx.DiGraph()
+                nodes=[int(n) for n in valid_nodes_from_edges]
+                flag_nodes=True
+                for n in nodes:
+                    if len(x_sparse[n].nonzero().view(-1))==0:
+                        print("non-valid due to [len(x_sparse[n].nonzero().view(-1))==0]")
+                        flag_nodes=False
+                        break
+                if flag_nodes==False or 0 not in nodes or int(x_sparse.size(0)-1) not in nodes:
+                    print("non-valid due to [flag_nodes==False]")
+                    continue
+                #print(n,"add",int(x_sparse[n].nonzero().view(-1)[0]))
+                #DG[n]['x_label']=int(x_sparse[n].nonzero().view(-1)[0])
+                    
+
+                DG.add_edges_from([(int(edge[0]),int(edge[1])) for edge in edge_index_sparse.t().numpy()])
+                print("edges=",DG.edges())
+                res_con_first=[]
+                res_con_last=[]
+                for node in nodes:
+                    #node 0 connect to any one
+                    if node != 0:
+                        res_con_first.append(nx.node_connectivity(DG, 0, node) ) 
+                    #any one connect to node n-1
+                    if node != int(x_sparse.size(0)-1):
+                        res_con_last.append(nx.node_connectivity(DG, node, int(x_sparse.size(0)-1)))
+
+                print("connection check: 0->x:",res_con_first,"x->n-1:",res_con_last)
+                if 0 not in res_con_first and 0 not in res_con_last:
+                    print("valid +1")
+                    filtered_graphs.append(g)
+                else:
+                    print("non-valid due to [0 in res_con_first or 0 in res_con_first]")
+
+        print("valid size=",len(filtered_graphs),"/",len(graphs))
+        return filtered_graphs
+
+
     def filter(self, graphs, key=None):
         mols = []
         #filtering
@@ -1632,7 +1719,7 @@ class ChooseNext():
         self.y_observed=None
     
     def next(self, candidates, acq_type):
-        best_one_idx = self.do_search_speedup(candidates, acq_type=acq_type, walkers=4)
+        best_one_idx = self.do_search_speedup(candidates, acq_type=acq_type, walkers=1)
         return [candidates[best_one_idx]],best_one_idx
 
     def score_one_can_Rand(self, d):
@@ -1764,7 +1851,11 @@ class testGenerativeQuality():
         #self.max = 2.0
         self.min = 0.0
         self.max = 1.0
+        self.start_time = time.time()
 
+    def evaluate_NN(self,input_g):
+        res = objective_func.evaluate_point(input_g)
+        return res
     #recall the real evaluation function to evaluate
     def evaluate_point(self, input):
         if input["smiles"]=="":
@@ -1773,16 +1864,12 @@ class testGenerativeQuality():
             y = objective_func.evaluate_point(input,target=self.target)
             #y_normized = y
             #y_normized = (y-self.min)/(self.max-self.min)
-            if target == 'joint':
-                y_normized = np.exp(y)
-            else:
-                y_normized = y
+            y_normized = np.exp(y)
         return y_normized
 
     def denormalize(self,res_list):
         #res_list = [y_normalized * (self.max-self.min) + self.min for y_normalized in res_list]
-        if target == 'joint':
-            res_list = [np.log(y_normalized) for y_normalized in res_list]
+        res_list = [np.log(y_normalized) for y_normalized in res_list]
         return res_list
         
     def test(self, generated_graphs,store_flag=True):
@@ -1799,13 +1886,31 @@ class testGenerativeQuality():
                     if self.count == 1:
                         fieldnames = ["# eval", 'smiles', 'properties', time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))]
                         csvwriter.writerow(fieldnames)
-                    csvwriter.writerow([self.count, mol["smiles"], self.denormalize([goal])[0]])
+                    csvwriter.writerow([self.count, mol["smiles"], goal])
+        return goal_list
+    
+    def test_NN(self, generated_graphs,store_flag=True):
+        goal_list = []
+        for mol in generated_graphs:
+            goal = self.evaluate_NN(mol)
+            goal_list.append({"y":goal})
+            if store_flag:
+                self.count += 1
+                #save into csv file
+                with open(self.filename,"a",newline="") as datacsv:
+                    csvwriter = csv.writer(datacsv)
+                    if self.count == 1:
+                        fieldnames = ["# eval", 'time', 'properties', time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))]
+                        csvwriter.writerow(fieldnames)
+                    csvwriter.writerow([self.count, time.time()-self.start_time,goal])
+                with open('results/architecture_%s_%s_%s.pkl'%(model_name,self.count,seed), 'wb') as f:
+                    pickle.dump(mol, f)
         return goal_list
     
     def test_dataset(self,dataset):
         res = []
         for i in range(len(dataset)):
-            res.append(dataset[i].y[:,TASK_NO].item())
+            res.append(dataset[i].y[:].item())
         return res
     
     def draw_dist(self, res_list, ax, color, label):
@@ -1854,7 +1959,7 @@ class testGenerativeQuality():
 
 def draw_dis(generator,Z, count):
     can_test = genCan.generate_candidates(generator, Z=Z, filter_flag=False, num_gen=1000, use_random=use_random)
-    results_list = eval_mol.test(can_test,store_flag=False)
+    results_list = eval_mol.test_NN(can_test,store_flag=False)
     #print(results_list)
     res_list_filtered = []
     for re in results_list:
@@ -1875,114 +1980,67 @@ def draw_dis(generator,Z, count):
 #test
 if __name__ == "__main__":
     
-        fixed_Z = torch.randn(1000,input_dim)
-        
         input_dim_n=dataset_info(dataset_name)["num_node_type"]
         input_dim_e=dataset_info(dataset_name)["num_edge_type"]
+
+        fixed_Z = torch.randn(1000,input_dim)
 
         #models
         encoder=Encoder(input_dim_n, input_dim_e, em_node_mlp=[57], em_edge_mlp=[57], node_mlp=[57], edge_mlp=[57], num_fine=5, encoder_out_dim=5*57, dropout=dropout, encoder_act=1, device=device)
         predictor=Predictor(encoder_out_dim=5*57, mlp_pre=[55,55,55,55,55], predictor_act=1, dropout=dropout, device=device)
         surrogate=DeepSurrogate(encoder, predictor)
-
-        generator=Generator_DeConv(max_nodes=max_nodes, input_dim=input_dim, num_node_type=dataset_info(dataset_name)["num_node_type"], num_edge_type=dataset_info(dataset_name)["num_edge_type"], channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(1,1),(1,4),(1,2),(1,2)], paddings=[(0,0),(0,0),(0,1),(0,1)], act=1, dropout=0.0, dataset=dataset_name, device=device)
         
+        generator=Generator_DeConv(max_nodes=max_nodes, input_dim=input_dim, num_node_type=dataset_info(dataset_name)["num_node_type"], num_edge_type=dataset_info(dataset_name)["num_edge_type"], channels = [64,32,32,1], kernels=[3,3,3,3], strides=[(1,1),(1,5),(2,4),(2,2)], paddings=[(0,0),(0,0),(1,1),(1,1)], output_padding=[(0,0),(0,0),(1,1),(1,1)], act=1, dropout=0.0, dataset=dataset_name, device=device)
+
         if pretrain_name is None:
             #do pretrain VAE
             vaeencoder=VAEEncoder(input_dim_n, input_dim_e, em_node_mlp=[57], em_edge_mlp=[57], node_mlp=[57], edge_mlp=[57], num_fine=5, encoder_out_dim=82, dropout=0., encoder_act=1, device=device)
         else:
             vaeencoder = None
+
         
         discriminator = []
+
         trainVAE = TrainVAE(vaeencoder, generator)
         trainSurr = TrainSurrogate(surrogate)
         trainGen = TrainGenerator(None, surrogate, discriminator,lam_1 = lam_1,lam_2 = lam_2,lam_3 = lam_3)
         genCan = GenCandidates(dataset=dataset_name)
         chooseNext = ChooseNext(surrogate, constraint=None, generator=generator, vaeencoder=vaeencoder)
         
-        eval_mol = testGenerativeQuality(filename=store_file_name,target=target, dataset=dataset_name)
-
+        eval_mol = testGenerativeQuality(filename=store_file_name,target='joint', dataset=dataset_name)
+        
         if pretrain_name is None:
             #do pretrain
             dataset = get_data(dataset_name)
             index_list = random.sample(range(len(dataset)),init_num)
             dataset.cutfromlist(index_list)
-
+            
             #train VAE
             trainVAE.train(dataset, batch_size=100, num_epochs=pretrain_num_epochs, learning_rate=1e-3, weight_decay=1e-5,run_one_batch=False)
-
-            generator.save_model("models/orig_rand%s"%init_num)
-            vaeencoder.save_model("models/orig_vae_rand%s"%init_num)
-
+            
+            generator.save_model("models/orig_rand%s_epoch%s"%(init_num,pretrain_num_epochs))
+            vaeencoder.save_model("models/orig_vae_rand%s_epoch%s"%(init_num,pretrain_num_epochs))
+            
             exit(0)
 
         else:
-            #do optimize
-            if exist_init_nets is None:
-                #the init networks are not exist, so we need to choose [init_num] nets from dataset randomly
-                dataset = get_data(dataset_name)
-                
-                index_list = random.sample(range(len(dataset)),init_num)
-                
-                dataset.cutfromlist(index_list)
-            
-            else:
-                #the init networks are exist
-                #make init data from file
-                init_smi = []
-                with open(exist_init_nets,mode='r') as initf:
-                    lines = initf.readlines()
-                    for line in lines:
-                        init_smi.append(line.strip())
-                print("init smiles:",init_smi)
-                
-                data_list = []
-                dataset = get_data(dataset_name)
-                for d in dataset:
-                    mol = to_mol({'x':d.x,'edge_index':d.edge_index,'edge_attr':d.edge_attr},dataset=dataset_name)
-                    if mol is None:
-                        new_mol = ""
-                    else:
-                        new_mol=Chem.MolToSmiles(mol)
-                    if new_mol in init_smi:
-                        data_list.append(d)
-                        print("found init data",len(data_list),"/",len(init_smi),end="\r")
-                        if len(data_list)>=init_num:
-                            break
-                dataset.data_list=data_list
-                dataset.cut(0,init_num)
+            #do pretrain
+            dataset = get_data(dataset_name)
+            index_list = random.sample(range(len(dataset)),init_num)
+            dataset.cutfromlist(index_list)
 
-        #restore the pretrained generation model
         generator.restore_model(pretrain_name)
+        #vaeencoder.restore_model("models/orig_vae_rand1000_epoch700")
 
         res=[]
         #evaluate the init graphs
         for i in range(len(dataset)):
-            results = eval_mol.test([[dataset[i].x,dataset[i].edge_index,dataset[i].edge_attr]],store_flag=True)
-            dataset[i].y[:,TASK_NO] = results[0]["y"]
-            dataset.data_list[i].y[:,TASK_NO] = results[0]["y"]
+            results = eval_mol.test_NN([[dataset[i].x,dataset[i].edge_index,dataset[i].edge_attr]],store_flag=True)
+            dataset[i].y[:] = results[0]["y"]
+            dataset.data_list[i].y[:] = results[0]["y"]
             res.append(results[0]["y"])
 
         genCan.init_observed_data(dataset)
-
-        """
-        res_orig = eval_mol.test_dataset(dataset)
-        res_orig = eval_mol.denormalize(res_orig)
-        res_train = copy.deepcopy(res_orig)
-        print("orig data set is ",np.mean(res_orig)," +- ", np.std(res_orig))
-
-        genCan.init_observed_data(dataset)
-
-        dataset_test = get_data(dataset_name)
-        dataset_test.cut(10000-100,10000+100)
-        #evaluate the init graphs
-        for i in range(len(dataset_test)):
-            results = eval_mol.test([[dataset_test[i].x,dataset_test[i].edge_index,dataset_test[i].edge_attr]],store_flag=False)
-            dataset_test[i].y[:,TASK_NO] = results[0]["y"]
-            dataset_test.data_list[i].y[:,TASK_NO] = results[0]["y"]
-
-        #exit(1)
-        """
 
         generator_orig = copy.deepcopy(generator)
 
@@ -2001,7 +2059,7 @@ if __name__ == "__main__":
                 
                 trainSurr.train(dataset, batch_size=len(dataset), learning_rate=1e-3, weight_decay=reg, seed=seed, num_epochs=surr_num_epochs, convergence_err=SMALL_NUMBER)
                 #trainSurr.eval_surrogate(valid=dataset_test,name="test",tau=tau)
-                #trainSurr.eval_surrogate(valid=dataset,name="train",tau=tau)
+                trainSurr.eval_surrogate(valid=dataset,name="train",tau=tau)
 
                 #update current generator curr_g
                 if iter_idx==0:
@@ -2013,10 +2071,10 @@ if __name__ == "__main__":
                 #if iter_idx%40==0:
                 #    draw_dis(generator,fixed_Z,iter_idx)
 
-            candidates_new = genCan.generate_candidates(generator, filter_flag=True, num_gen=500, use_random=use_random)
-            candidates_orig = genCan.generate_candidates(generator_orig, filter_flag=True, num_gen=500, use_random=use_random)
+            candidates_new = genCan.generate_candidates(generator, filter_flag=True, num_gen=1000, use_random=use_random)
+            candidates_orig = genCan.generate_candidates(generator_orig, filter_flag=True, num_gen=1000, use_random=use_random)
             
-            candidates = genCan.filter(candidates_new + candidates_orig)
+            candidates = candidates_new + candidates_orig
             
             print("gen=",len(candidates_new),"orig=",len(candidates_orig),"total=",len(candidates))
             chooseNext.trainGen=trainGen
@@ -2031,12 +2089,12 @@ if __name__ == "__main__":
             #else:
                 #next_g = next_g_1 + next_g_2
             next_g = next_g_1
-            evaluation_list = eval_mol.test(next_g)
+            evaluation_list = eval_mol.test_NN(next_g)
             genCan.update_observed_data(next_g,evaluation_list)
             for i in range(len(evaluation_list)):
-                augment_into(dataset,{'x':next_g[i][0].float(),'edge_index':next_g[i][1].long(),'edge_attr':next_g[i][2].float(),'y':torch.tensor([evaluation_list[i]["y"] if j==TASK_NO else 0. for j in range(dataset[0].y.size(1))]).view(1,-1).float()}, comments=evaluation_list[i]["smiles"])
-                #res_train.append(evaluation_list[i]["y"])
-            print(dataset,eval_mol.denormalize([evaluation_list[i]["y"] for i in range(len(evaluation_list))]))
+                if evaluation_list[i]["y"] != -10.:
+                    augment_into(dataset,{'x':next_g[i][0].float(),'edge_index':next_g[i][1].long(),'edge_attr':next_g[i][2].float(),'y':torch.tensor([evaluation_list[i]["y"]]).view(-1).float()}, comments="add one")
+            #print(dataset,eval_mol.denormalize([evaluation_list[i]["y"] for i in range(len(evaluation_list))]))
 
             #generator.save_model("models/iter_%s_%s_%s_%s"%(model_name,acq_type,seed,iter_idx+1))
 
