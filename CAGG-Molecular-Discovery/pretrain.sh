@@ -8,4 +8,4 @@ do
 done
 
 #pretrain
-python CAND.py --dataset="qm9" --max_nodes=9 --init_num=1000 --seed=1
+python CAGG.py --dataset="qm9" --max_nodes=9 --init_num=1000 --seed=1
