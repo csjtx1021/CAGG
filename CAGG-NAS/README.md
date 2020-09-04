@@ -1,7 +1,6 @@
 Application: Neural Architecture Search (NAS), including cell-based NAS and  multi-branch NAS
 
-This code is implemented according to paper "Cost-Aware Network Design with Deep Bayesian Optimization 
-and Goal-Oriented Generation". Cost-Aware Network Design (CAND) can design optimal networks at as low cost 
+This code is implemented according to paper "Cost-Aware Graph Generation: A Deep Bayesian Optimization Approach". Cost-Aware Graph Generation (CAGG) can generate optimal graphs at as low cost s
 as possible.  We apply it to two challenging real-world problems, i.e., molecular discovery and neural architecture
 search, to rigorously evaluate its effectiveness and applicability.
 
@@ -22,15 +21,15 @@ After installing all dependency packages and preparing the datasets, you can run
 
 Or you can see the help message by running as:
     
-    $$ python CAND_Cell_based_NAS.py -h
+    $$ python CAGG_Cell_based_NAS.py -h
     
     or
     
-    $$ python CAND_Multi_Branch_NAS.py -h
+    $$ python CAGG_Multi_Branch_NAS.py -h
 
 Run this code:
 
-(Before running the CAND, you should make the dir first by hand or running following codes in shell:
+(Before running the CAGG, you should make the dir first by hand or running following codes in shell:
 
     for build_dir in "models" "results"
     do
@@ -41,7 +40,7 @@ Run this code:
 
 (1) Pretrain the generation model in a VAE fashion by running as:
 
-    $$ python CAND_Multi_Branch_NAS.py --dataset="nn" --max_nodes=20 --init_num=1000 --seed=1
+    $$ python CAGG_Multi_Branch_NAS.py --dataset="nn" --max_nodes=20 --init_num=1000 --seed=1
     
 or, run an example as
 
@@ -49,17 +48,17 @@ or, run an example as
     
 (NOTE: In NAS problems, only Multi-Branch NAS needs the pretrain.)
     
-(2) Run CAND code: 
+(2) Run CAGG code: 
 
 For cell-based NAS:
 
-    $$ python CAND_Cell_based_NAS.py --dataset="NASBench201" --max_nodes=4 --max_iter=390 --init_num=10 --image_data="cifar100" --store_file_name="results/observations.csv" --seed=1
+    $$ python CAGG_Cell_based_NAS.py --dataset="NASBench201" --max_nodes=4 --max_iter=390 --init_num=10 --image_data="cifar100" --store_file_name="results/observations.csv" --seed=1
 
 DATA: When you want choose image data, you can use the [--image_data] option.
 
 For multi-branch NAS:
     
-    $$ python CAND_Multi_Branch_NAS.py --dataset="nn" --max_nodes=20 --max_iter=60 --init_num=10 --store_file_name="results/observations.csv" --pretrain_name="models/orig_rand1000_epoch70" --seed=1
+    $$ python CAGG_Multi_Branch_NAS.py --dataset="nn" --max_nodes=20 --max_iter=60 --init_num=10 --store_file_name="results/observations.csv" --pretrain_name="models/orig_rand1000_epoch70" --seed=1
     
 DATA: When you want to choose different MLP data, you can open one of lines 15 and 16 in ``objective_func.py'' as follows
 

@@ -8,4 +8,4 @@ do
 done
 
 #pretrain
-python CAND_Multi_Branch_NAS.py --dataset="nn" --max_nodes=20 --init_num=1000 --seed=1
+python CAGG_Multi_Branch_NAS.py --dataset="nn" --max_nodes=20 --init_num=1000 --seed=1
