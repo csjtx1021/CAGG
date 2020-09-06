@@ -1,4 +1,4 @@
-This code is implemented according to paper "Cost-Aware Graph Generation: A Deep Bayesian Optimization Approach". Cost-Aware Graph Generation (CAGG) can generate optimal graphs at as low cost 
+This code is implemented according to the paper "Cost-Aware Graph Generation: A Deep Bayesian Optimization Approach". Cost-Aware Graph Generation (CAGG) can generate optimal graphs at as low cost 
 as possible.  We apply it to two challenging real-world problems, i.e., molecular discovery and neural architecture
 search, to rigorously evaluate its effectiveness and applicability.
 
